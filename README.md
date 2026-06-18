@@ -117,7 +117,8 @@ Proxied from host available memory utilization (fully happy ≤ 70%, fully unhap
 - The account running the script must have **cluster administrative rights** and permission to perform Live Migrations
 
 See [INSTALL.md](INSTALL.md) for full prerequisites and deployment instructions.  
-See [USAGE.md](USAGE.md) for detailed examples, scheduling, and tuning guidance.
+See [USAGE.md](USAGE.md) for detailed examples, scheduling, and tuning guidance.  
+See [TESTS.md](TESTS.md) for the test suite layout, coverage details, and how to run the tests.
 
 ---
 
