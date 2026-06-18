@@ -68,7 +68,9 @@ Tests/
 ├── Find-MigrationCandidates.Tests.ps1        # Unit tests for the migration planning logic
 ├── Get-MigrationRuleImpact.Tests.ps1         # Unit tests for per-migration rule impact evaluation
 ├── Test-AffinityCompliance.Tests.ps1         # Unit tests for current-placement violation detection
-└── AffinityRules.Tests.ps1                   # Unit tests for CRUD operations on the rule store
+├── AffinityRules.Tests.ps1                   # Unit tests for CRUD operations on the rule store
+├── Measure-CsvHappiness.Tests.ps1            # Unit tests for CSV happiness scoring
+└── Find-StorageMigrationCandidates.Tests.ps1 # Unit tests for storage migration planning
 ```
 
 ### `Tests/Helpers/New-TestObjects.ps1`
@@ -322,6 +324,91 @@ Tests the public CRUD functions in `Functions/Public/AffinityRules.ps1` using a 
 
 ---
 
+### `Measure-CsvHappiness.Tests.ps1` — 20 tests
+
+Tests the CSV happiness scoring formula in `Functions/Private/Measure-CsvHappiness.ps1`.
+
+**Space Happiness** (7 tests)
+
+| Free space | Formula | Expected |
+|---|---|---|
+| ≥ 40% (e.g. 60%) | 100 | 100.0 |
+| Exactly 40% | 100 | 100.0 |
+| 30% (midpoint 20–40%) | 50 + (30-20)*2.5 | 75.0 |
+| Exactly 20% | 50 + 0 | 50.0 |
+| 15% (midpoint 10–20%) | (15-10)*5 | 25.0 |
+| Exactly 10% | (10-10)*5 | 0.0 |
+| < 10% (e.g. 5%) | clamped | 0.0 |
+
+**IO Happiness — latency** (6 tests)
+
+| Latency | Expected |
+|---|---|
+| ≤ 5 ms (e.g. 1.5 ms) | 100.0 |
+| Exactly 5 ms | 100.0 |
+| 12.5 ms (midpoint 5–20 ms) | ≈ 50.0 |
+| Exactly 20 ms | ≈ 0.0 |
+| > 20 ms (e.g. 35 ms) | 0.0 |
+| LatencyMs is null | IoHappiness is null |
+
+**Fallback to space-only when no I/O data** (2 tests)
+
+- `HappinessScore` equals `SpaceHappiness` when `LatencyMs` is null, regardless of `IoWeight`.
+- A CSV without I/O data scores higher than one with bad latency at the same free-space level.
+
+**Combined score with weights** (5 tests)
+
+- Default weights (0.7/0.3) produce correct weighted average.
+- `IoWeight=0` → pure space score even with bad latency.
+- `SpaceWeight=0` with latency data → pure I/O score.
+- Both components at 100 → 100.0.
+- Both components at 0 → 0.0.
+
+**Output object** (4 tests)
+
+- All four properties present (`CsvName`, `SpaceHappiness`, `IoHappiness`, `HappinessScore`).
+- `CsvName` echoes input name.
+- `HappinessScore` has at most one decimal place.
+- Score is bounded within 0–100.
+
+---
+
+### `Find-StorageMigrationCandidates.Tests.ps1` — 15 tests
+
+Tests the storage migration planning logic in `Functions/Private/Find-StorageMigrationCandidates.ps1`. No cluster or Hyper-V cmdlets are called.
+
+**Basic triggering** (3 tests)
+
+- Unhappy CSV with a movable VM → migration recommended.
+- All CSVs happy → no recommendations.
+- Unhappy CSV but no VMs → no recommendations.
+
+**MinFreeGBReserve constraint** (2 tests)
+
+- Destination excluded when `FreeGB − vm.TotalVhdGB < MinFreeGBReserve`.
+- Destination included when headroom meets reserve.
+
+**Aggression levels** (3 tests)
+
+- CSV at score 62.5 not triggered at level 3 (threshold=50).
+- Same CSV triggered at level 5 (threshold=70).
+- Trivially small VHD produces too little improvement to meet level-1 minimum (+40 pts).
+
+**Destination selection** (1 test)
+
+- When multiple valid destinations exist, the planner selects one and produces a single candidate.
+
+**Greedy state update** (2 tests)
+
+- Same VM never appears twice in the migration list.
+- After first VM is planned, simulated destination headroom is reduced; second VM of same size is correctly excluded.
+
+**Output object fields** (9 tests)
+
+Verifies all fields on the returned migration object: `VMName`, `HostNode`, `SourceCSV`, `SourceCSVName`, `DestinationCSV`, `DestinationCSVName`, `TotalVhdGB`, `SourceFreeGBBefore/After`, `DestFreeGBBefore/After`, `SourceScoreBefore/After`, `DestScoreBefore/After`, `Improvement`. Also verifies sign invariants: `Improvement > 0`, `SourceScoreAfter > SourceScoreBefore`, free-GB accounting identity.
+
+---
+
 ## What Is Not Tested
 
 The following require a live Hyper-V Failover Cluster and are not covered by the unit test suite:
@@ -331,6 +418,9 @@ The following require a live Hyper-V Failover Cluster and are not covered by the
 | `Get-ClusterSnapshot` | Calls `Invoke-Command` against real cluster nodes, `Get-Counter`, `Get-VM`, `Get-NetAdapterStatistics` |
 | `Invoke-HvDRS` | Orchestration layer; correctness depends on real cluster state |
 | `Move-ClusterVirtualMachineRole` | Requires cluster infrastructure |
+| `Get-StorageSnapshot` | Calls `Get-ClusterSharedVolume`, `Get-VM`, `Get-VHD`, `Get-Counter` against live cluster |
+| `Invoke-HvStorageDRS` | Orchestration layer; correctness depends on real cluster and CSV state |
+| `Move-VMStorage` | Requires cluster infrastructure and CSV storage |
 | Maintenance helpers | Filesystem operations only; no non-trivial logic to unit test |
 
-Integration testing of those components is best done with `Invoke-HvDRS -WhatIf` against a test cluster or a single-node Hyper-V lab.
+Integration testing of those components is best done with `-WhatIf` or `-RecommendOnly` against a test cluster or a single-node Hyper-V lab.

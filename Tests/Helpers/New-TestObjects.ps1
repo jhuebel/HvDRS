@@ -58,3 +58,66 @@ function New-Snapshot {
         VMs         = $VMs
     }
 }
+
+# ── Storage DRS helpers ────────────────────────────────────────────────────────
+
+function New-CsvMetrics {
+    param(
+        [string] $Name      = 'Volume1',
+        [string] $Path      = 'C:\ClusterStorage\Volume1',
+        [string] $OwnerNode = 'NODE1',
+        [float]  $TotalGB   = 2048.0,
+        [float]  $FreeGB    = 1024.0,
+        [object] $LatencyMs = $null,   # nullable; $null = I/O data not available
+        [object] $ReadIOPS  = $null,
+        [object] $WriteIOPS = $null
+    )
+    $usedGB = $TotalGB - $FreeGB
+    [PSCustomObject]@{
+        Name         = $Name
+        Path         = $Path
+        OwnerNode    = $OwnerNode
+        TotalGB      = $TotalGB
+        FreeGB       = $FreeGB
+        UsedGB       = $usedGB
+        SpaceUsedPct = if ($TotalGB -gt 0) { [Math]::Round(($usedGB / $TotalGB) * 100.0, 1) } else { 0.0 }
+        LatencyMs    = $LatencyMs
+        ReadIOPS     = $ReadIOPS
+        WriteIOPS    = $WriteIOPS
+    }
+}
+
+function New-VmStorageMetrics {
+    param(
+        [string] $Name       = 'VM1',
+        [string] $HostNode   = 'NODE1',
+        [string] $PrimaryCSV = 'C:\ClusterStorage\Volume1',
+        [float]  $TotalVhdGB = 50.0
+    )
+    [PSCustomObject]@{
+        VMName     = $Name
+        VMId       = [System.Guid]::NewGuid().ToString()
+        HostNode   = $HostNode
+        PrimaryCSV = $PrimaryCSV
+        TotalVhdGB = $TotalVhdGB
+        VHDs       = @([PSCustomObject]@{
+            Path   = "$PrimaryCSV\VMs\$Name\$Name.vhdx"
+            SizeGB = $TotalVhdGB
+            CSV    = $PrimaryCSV
+        })
+    }
+}
+
+function New-StorageSnapshot {
+    param(
+        [string]           $ClusterName = 'TEST-CLUSTER',
+        [PSCustomObject[]] $CSVs,
+        [PSCustomObject[]] $VMs
+    )
+    [PSCustomObject]@{
+        ClusterName = $ClusterName
+        Timestamp   = Get-Date
+        CSVs        = $CSVs
+        VMs         = $VMs
+    }
+}

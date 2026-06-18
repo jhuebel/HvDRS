@@ -251,6 +251,119 @@ When running without `-WhatIf` or `-RecommendOnly`, migrations execute immediate
 
 ---
 
+## Invoke-HvStorageDRS
+
+Balances Cluster Shared Volume utilization by live-migrating VM storage (VHDs + config) between CSVs while the VMs remain running.
+
+### Syntax
+
+```
+Invoke-HvStorageDRS
+    [-ClusterName <String>]
+    [-AggressionLevel <Int32>]
+    [-SampleCount <Int32>]
+    [-SampleIntervalSeconds <Int32>]
+    [-SpaceWeight <Single>]
+    [-IoWeight <Single>]
+    [-MinFreeGBReserve <Int32>]
+    [-RecommendOnly]
+    [-MaintenanceLockFile <String>]
+    [-WhatIf]
+    [-Verbose]
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `-ClusterName` | String | Local cluster | Target Failover Cluster name |
+| `-AggressionLevel` | Int (1–5) | 3 | Migration sensitivity — same thresholds as Invoke-HvDRS |
+| `-SampleCount` | Int | 3 | I/O counter samples to average per CSV. Set to 0 to skip I/O collection entirely |
+| `-SampleIntervalSeconds` | Int | 5 | Seconds between I/O samples |
+| `-SpaceWeight` | Float (0–1) | 0.7 | Weight of space happiness in combined CSV score |
+| `-IoWeight` | Float (0–1) | 0.3 | Weight of I/O (latency) happiness. Silently dropped for CSVs where counters are unavailable |
+| `-MinFreeGBReserve` | Int | 50 | Free space (GB) that must remain on the destination CSV after VHDs land |
+| `-RecommendOnly` | Switch | — | Print the migration plan but never call Move-VMStorage |
+| `-MaintenanceLockFile` | String | `$env:ProgramData\HvDRS\maintenance.lock` | Shared with Invoke-HvDRS; one lock file pauses both |
+| `-WhatIf` | Switch | — | Standard PowerShell dry-run |
+| `-Verbose` | Switch | — | Shows per-CSV counter collection progress |
+
+### CSV Happiness scoring
+
+**Space happiness** — based on free space percentage:
+
+| Free % | Score |
+|---|---|
+| ≥ 40% | 100 |
+| 20–40% | 50 + (pct – 20) × 2.5 |
+| 10–20% | (pct – 10) × 5 |
+| < 10% | 0 |
+
+**IO happiness** — based on average disk transfer latency (`LatencyMs`). When latency counters are unavailable the IO weight is dropped and scoring falls back to space-only automatically.
+
+| Latency | Score |
+|---|---|
+| ≤ 5 ms | 100 |
+| 5–20 ms | 100 − (lat − 5) × 6.67 |
+| > 20 ms | 0 |
+
+### Common scenarios
+
+```powershell
+# Dry run — see what would be moved
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -WhatIf
+
+# Space-only scoring (skip I/O counter collection)
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -SampleCount 0
+
+# Aggressive rebalancing; require 100 GB headroom after each move
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -AggressionLevel 5 -MinFreeGBReserve 100
+
+# Pure space scoring — ignore latency weighting entirely
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -SpaceWeight 1.0 -IoWeight 0.0
+```
+
+### Relationship to Invoke-HvDRS
+
+`Invoke-HvDRS` and `Invoke-HvStorageDRS` are independent passes that can be run in sequence:
+
+```powershell
+# Rebalance compute placement, then storage placement
+Invoke-HvDRS        -ClusterName 'PROD-CLUSTER'
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER'
+```
+
+Both honour the same maintenance lock file, so `Enable-HvDRSMaintenance` suspends both.
+
+### Understanding the output
+
+A typical run produces three sections:
+
+```
+── CSV Summary ───────────────────────────────────────────────────────────────
+
+CSV       Owner    Total GB  Used GB  Free GB  Used %  Read IOPS  Write IOPS  Latency ms
+---       -----    --------  -------  -------  ------  ---------  ----------  ----------
+Volume1   HV-NODE1   2048.0   1945.0    103.0    94.9       2450        1100        12.4
+Volume2   HV-NODE2   2048.0    512.0   1536.0    25.0        340         120         2.1
+
+── CSV Happiness Scores ──────────────────────────────────────────────────────
+
+CSV      Space Happy  IO Happy  Score  Status
+---      -----------  --------  -----  ------
+Volume1          0.0      15.3    4.6  CRITICAL
+Volume2        100.0     100.0  100.0  Healthy
+
+── 2 Storage Migration Recommendation(s) ────────────────────────────────────
+
+VM      Host      From CSV  To CSV   Data GB  Src Score    Dst Score    Src Free GB    Delta
+--      ----      --------  ------   -------  ---------    ---------    -----------    -----
+SQL-01  HV-NODE1  Volume1   Volume2   500.0   4.6 → 28.3  100.0 → 75.5  103 → 603   +23.7
+APP-01  HV-NODE1  Volume1   Volume2   200.0   4.6 → 38.7   75.5 → 65.2  103 → 303   +34.1
+```
+
+---
+
 ## Affinity and Anti-Affinity Rules
 
 HvDRS supports four rule types that constrain where VMs may run. Rules are stored in a JSON file (default: `$env:ProgramData\HvDRS\rules.json`) and are automatically loaded by `Invoke-HvDRS` each pass.
