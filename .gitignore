@@ -1,0 +1,9 @@
+# PowerShell session artifacts
+*.pssproj.user
+
+# Log files
+*.log
+Logs/
+
+# Maintenance lock (runtime state, not source)
+*.lock
