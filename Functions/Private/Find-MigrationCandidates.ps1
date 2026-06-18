@@ -1,23 +1,40 @@
 function Find-MigrationCandidates {
     <#
     .SYNOPSIS
-        Identifies VMs that would benefit from Live Migration and selects optimal destination nodes.
+        Identifies VMs that would benefit from Live Migration and selects optimal destination nodes,
+        now with full affinity / anti-affinity rule awareness.
 
     .DESCRIPTION
-        Algorithm:
-          1. Score every running VM using Measure-VmHappiness.
-          2. Sort by score ascending (most miserable first).
-          3. For each VM below the aggression-level happiness threshold:
-             a. Retrieve cluster possible-owners (respects affinity rules).
-             b. Exclude network-saturated destinations (Network-Aware DRS).
-             c. Exclude destinations with insufficient free memory.
-             d. Simulate post-migration happiness on each candidate.
-             e. If the best improvement exceeds the aggression-level improvement threshold, add
-                the migration to the plan and update the simulated cluster state so subsequent
-                decisions account for already-planned moves.
+        Two-pass algorithm:
 
-    .OUTPUTS
-        List of PSCustomObjects describing each recommended migration.
+        Pass 1 — Compliance (hard-rule violations in the current placement)
+          For each enforced rule that is currently violated, Find-MigrationCandidates selects
+          the best (VM, destination) pair that resolves the violation without introducing any
+          new hard-rule violations. These migrations are added to the plan first, ahead of any
+          happiness-based recommendations, and the simulated cluster state is updated so that
+          subsequent decisions account for them.
+
+        Pass 2 — Happiness (load balancing)
+          Each VM below the aggression-level happiness threshold is evaluated against every
+          candidate destination node. The rule impact of each proposed move is checked:
+            • Hard violation → destination excluded.
+            • Soft violation → configurable score penalty applied to the projected happiness.
+            • Fixes a violation → configurable score bonus applied.
+          Only moves whose net improvement (post-adjustment) meets the aggression threshold
+          are included in the plan.
+
+    .PARAMETER RuleSet
+        Array of affinity / anti-affinity rule objects returned by Get-AffinityRuleSet.
+        Pass an empty array or omit to disable rule checking entirely.
+
+    .PARAMETER SoftRuleViolationPenalty
+        Points subtracted from a candidate destination's projected happiness score when the
+        move would break a soft (non-enforced) rule (default: 25).
+
+    .PARAMETER RuleComplianceBonus
+        Points added to a candidate's projected score when the move fixes an existing
+        soft-rule violation (default: 25). Hard-rule compliance migrations are always
+        recommended regardless of the happiness improvement.
     #>
     [CmdletBinding()]
     param(
@@ -30,11 +47,12 @@ function Find-MigrationCandidates {
         [float]$CpuWeight    = 0.5,
         [float]$MemoryWeight = 0.5,
 
-        # Destination hosts with network utilization above this % are excluded.
-        [float]$MaxDestinationNetworkUtil = 70.0,
+        [float]$MaxDestinationNetworkUtil    = 70.0,
+        [int]  $DestinationMemoryReserveMB  = 512,
 
-        # Minimum free memory (MB) that must remain on the destination after migration.
-        [int]$DestinationMemoryReserveMB = 512,
+        [PSCustomObject[]]$RuleSet                  = @(),
+        [float]           $SoftRuleViolationPenalty = 25.0,
+        [float]           $RuleComplianceBonus      = 25.0,
 
         [Parameter(Mandatory)]
         [string]$ClusterName
@@ -51,16 +69,15 @@ function Find-MigrationCandidates {
     $happinessThreshold   = $thresholds[$AggressionLevel].Happiness
     $improvementThreshold = $thresholds[$AggressionLevel].Improvement
 
-    # Score all running VMs
+    # Score all running VMs (needed by both passes)
     $vmScores = foreach ($vm in $Snapshot.VMs) {
-        $host = $Snapshot.Nodes | Where-Object { $_.NodeName -eq $vm.HostNode }
-        if (-not $host) { continue }
-        Measure-VmHappiness -VmMetrics $vm -HostMetrics $host `
+        $hostMetrics = $Snapshot.Nodes | Where-Object { $_.NodeName -eq $vm.HostNode }
+        if (-not $hostMetrics) { continue }
+        Measure-VmHappiness -VmMetrics $vm -HostMetrics $hostMetrics `
                             -CpuWeight $CpuWeight -MemoryWeight $MemoryWeight
     }
 
-    # Mutable simulated node state — updated as migrations are planned so that
-    # later decisions in the same pass account for already-queued moves.
+    # Mutable simulated node state — updated as migrations are planned
     $simNodes = @{}
     foreach ($node in $Snapshot.Nodes) {
         $simNodes[$node.NodeName] = [PSCustomObject]@{
@@ -76,6 +93,144 @@ function Find-MigrationCandidates {
     $scheduledVMs = [System.Collections.Generic.HashSet[string]]::new()
     $migrations   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+    # ── Helper: simulate a VM on a candidate node and score it ────────────────
+    $simulateAndScore = {
+        param($vm, $candidate)
+
+        $cpuImpact = ($vm.CpuUtilization / 100.0) *
+                     ($vm.ProcessorCount / $candidate.LogicalProcessorCount) * 100.0
+
+        $simHost = [PSCustomObject]@{
+            NodeName              = $candidate.NodeName
+            CpuUtilization        = [Math]::Min(100.0, $candidate.CpuUtilization + $cpuImpact)
+            TotalMemoryMB         = $candidate.TotalMemoryMB
+            AvailableMemoryMB     = $candidate.AvailableMemoryMB - $vm.MemoryAssignedMB
+            LogicalProcessorCount = $candidate.LogicalProcessorCount
+            NetworkUtilization    = $candidate.NetworkUtilization
+        }
+
+        $simPressure = $vm.MemoryPressure
+        if ($vm.DynamicMemoryEnabled -and
+            $candidate.AvailableMemoryMB -gt ($vm.MemoryAssignedMB * 1.5)) {
+            $simPressure = [Math]::Min($vm.MemoryPressure, 100.0)
+        }
+
+        $simVm = [PSCustomObject]@{
+            VMName               = $vm.VMName
+            HostNode             = $candidate.NodeName
+            CpuUtilization       = $vm.CpuUtilization
+            ProcessorCount       = $vm.ProcessorCount
+            MemoryAssignedMB     = $vm.MemoryAssignedMB
+            MemoryDemandMB       = $vm.MemoryDemandMB
+            DynamicMemoryEnabled = $vm.DynamicMemoryEnabled
+            MemoryPressure       = $simPressure
+        }
+
+        Measure-VmHappiness -VmMetrics $simVm -HostMetrics $simHost `
+                            -CpuWeight $CpuWeight -MemoryWeight $MemoryWeight
+    }
+
+    # ── Helper: update simulated node state after a planned migration ─────────
+    $applySimulatedMove = {
+        param($vm, $srcName, $dstName)
+        $src = $simNodes[$srcName]
+        $dst = $simNodes[$dstName]
+        $srcRelief = ($vm.CpuUtilization/100.0) * ($vm.ProcessorCount/$src.LogicalProcessorCount) * 100.0
+        $dstLoad   = ($vm.CpuUtilization/100.0) * ($vm.ProcessorCount/$dst.LogicalProcessorCount) * 100.0
+        $src.CpuUtilization    = [Math]::Max(0.0,   $src.CpuUtilization   - $srcRelief)
+        $src.AvailableMemoryMB = $src.AvailableMemoryMB + $vm.MemoryAssignedMB
+        $dst.CpuUtilization    = [Math]::Min(100.0, $dst.CpuUtilization   + $dstLoad)
+        $dst.AvailableMemoryMB = $dst.AvailableMemoryMB - $vm.MemoryAssignedMB
+    }
+
+    # ── Helper: get cluster possible-owners for a VM ──────────────────────────
+    $getPossibleOwners = {
+        param($vmName)
+        try {
+            (Get-ClusterOwnerNode -Cluster $ClusterName `
+                                  -Group "Virtual Machine $vmName" `
+                                  -ErrorAction Stop).OwnerNodes.Name
+        } catch {
+            $Snapshot.Nodes | Select-Object -ExpandProperty NodeName
+        }
+    }
+
+    # ── Helper: basic destination filter (network, memory, ownership) ─────────
+    $basicFilter = {
+        param($vm, $possibleOwners, $excludeNode)
+        $simNodes.Values | Where-Object {
+            $_.NodeName -ne $excludeNode -and
+            ($possibleOwners -contains $_.NodeName) -and
+            $_.NetworkUtilization -lt $MaxDestinationNetworkUtil -and
+            ($_.AvailableMemoryMB - $vm.MemoryAssignedMB) -ge $DestinationMemoryReserveMB
+        }
+    }
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # PASS 1 — Compliance migrations (fix enforced-rule violations first)
+    # ════════════════════════════════════════════════════════════════════════════
+    if ($RuleSet -and $RuleSet.Count -gt 0) {
+        $hardViolations = @(Test-AffinityCompliance -Snapshot $Snapshot -RuleSet $RuleSet |
+                            Where-Object { $_.Enforced })
+
+        foreach ($violation in $hardViolations) {
+            $movable = @($violation.VMs | Where-Object { -not $scheduledVMs.Contains($_) })
+            if ($movable.Count -eq 0) { continue }
+
+            $bestFix   = $null
+            $bestScore = -1
+
+            foreach ($vmName in $movable) {
+                $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
+                if (-not $vm) { continue }
+
+                $possibleOwners = & $getPossibleOwners $vmName
+                $candidates     = & $basicFilter $vm $possibleOwners $vm.HostNode
+
+                foreach ($candidate in $candidates) {
+                    $impact = Get-MigrationRuleImpact -VMName $vmName `
+                                                      -DestinationNode $candidate.NodeName `
+                                                      -Snapshot $Snapshot -RuleSet $RuleSet
+
+                    # Skip destinations that break another hard rule or don't fix this one
+                    if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
+
+                    $projected = & $simulateAndScore $vm $candidate
+                    if ($projected.HappinessScore -gt $bestScore) {
+                        $bestScore = $projected.HappinessScore
+                        $currentScoreObj = $vmScores | Where-Object { $_.VMName -eq $vmName }
+                        $bestFix = [PSCustomObject]@{
+                            VMName             = $vmName
+                            VMId               = $vm.VMId
+                            SourceNode         = $vm.HostNode
+                            DestinationNode    = $candidate.NodeName
+                            CurrentScore       = $currentScoreObj.HappinessScore
+                            ProjectedScore     = [Math]::Round($projected.HappinessScore, 1)
+                            Improvement        = [Math]::Round($projected.HappinessScore - $currentScoreObj.HappinessScore, 1)
+                            CpuHappinessBefore = $currentScoreObj.CpuHappiness
+                            MemHappinessBefore = $currentScoreObj.MemHappiness
+                            CpuHappinessAfter  = [Math]::Round($projected.CpuHappiness, 1)
+                            MemHappinessAfter  = [Math]::Round($projected.MemHappiness, 1)
+                            ComplianceReason   = $violation.Description
+                        }
+                    }
+                }
+            }
+
+            if ($bestFix) {
+                $migrations.Add($bestFix)
+                [void]$scheduledVMs.Add($bestFix.VMName)
+                $fixVm = $Snapshot.VMs | Where-Object { $_.VMName -eq $bestFix.VMName }
+                & $applySimulatedMove $fixVm $bestFix.SourceNode $bestFix.DestinationNode
+            } else {
+                Write-Verbose "  No valid destination found to resolve: $($violation.Description)"
+            }
+        }
+    }
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # PASS 2 — Happiness-based migrations (load balancing)
+    # ════════════════════════════════════════════════════════════════════════════
     $unhappyVMs = $vmScores |
                   Where-Object { $_.HappinessScore -lt $happinessThreshold } |
                   Sort-Object HappinessScore   # most unhappy first
@@ -86,69 +241,34 @@ function Find-MigrationCandidates {
         $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $score.VMName }
         if (-not $vm) { continue }
 
-        # ── Cluster ownership constraints ──────────────────────────────────────
-        $possibleOwners = try {
-            (Get-ClusterOwnerNode -Cluster $ClusterName `
-                                  -Group "Virtual Machine $($vm.VMName)" `
-                                  -ErrorAction Stop).OwnerNodes.Name
-        } catch {
-            # Group not found or no constraints — allow all nodes
-            $Snapshot.Nodes | Select-Object -ExpandProperty NodeName
-        }
+        $possibleOwners  = & $getPossibleOwners $score.VMName
+        $candidates      = & $basicFilter $vm $possibleOwners $score.HostNode
 
-        # ── Filter destination candidates ──────────────────────────────────────
-        $candidates = $simNodes.Values | Where-Object {
-            $_.NodeName -ne $score.HostNode -and
-            ($possibleOwners -contains $_.NodeName) -and
-            $_.NetworkUtilization -lt $MaxDestinationNetworkUtil -and
-            ($_.AvailableMemoryMB - $vm.MemoryAssignedMB) -ge $DestinationMemoryReserveMB
-        }
+        if (-not $candidates) { continue }
 
-        if (-not $candidates) {
-            Write-Verbose "  No eligible destination for '$($vm.VMName)' (network-saturated or insufficient memory on all candidates)."
-            continue
-        }
-
-        # ── Simulate placement on each candidate; pick the best improvement ────
-        $bestMigration  = $null
+        $bestMigration   = $null
         $bestImprovement = 0.0
 
         foreach ($candidate in $candidates) {
-            # CPU impact of the VM on the destination host
-            $cpuImpact = ($vm.CpuUtilization / 100.0) *
-                         ($vm.ProcessorCount / $candidate.LogicalProcessorCount) * 100.0
-
-            $simHostMetrics = [PSCustomObject]@{
-                NodeName              = $candidate.NodeName
-                CpuUtilization        = [Math]::Min(100.0, $candidate.CpuUtilization + $cpuImpact)
-                TotalMemoryMB         = $candidate.TotalMemoryMB
-                AvailableMemoryMB     = $candidate.AvailableMemoryMB - $vm.MemoryAssignedMB
-                LogicalProcessorCount = $candidate.LogicalProcessorCount
-                NetworkUtilization    = $candidate.NetworkUtilization
+            # Rule impact check
+            $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
+                Get-MigrationRuleImpact -VMName $vm.VMName `
+                                        -DestinationNode $candidate.NodeName `
+                                        -Snapshot $Snapshot -RuleSet $RuleSet
+            } else {
+                [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
             }
 
-            # For Dynamic Memory VMs: if the destination has ample headroom, assume
-            # pressure will normalise back to 100 (balanced) after migration.
-            $simMemPressure = $vm.MemoryPressure
-            if ($vm.DynamicMemoryEnabled -and
-                $candidate.AvailableMemoryMB -gt ($vm.MemoryAssignedMB * 1.5)) {
-                $simMemPressure = [Math]::Min($vm.MemoryPressure, 100.0)
-            }
+            if ($impact.HasHardViolation) { continue }
 
-            $simVmMetrics = [PSCustomObject]@{
-                VMName               = $vm.VMName
-                HostNode             = $candidate.NodeName
-                CpuUtilization       = $vm.CpuUtilization
-                ProcessorCount       = $vm.ProcessorCount
-                MemoryAssignedMB     = $vm.MemoryAssignedMB
-                MemoryDemandMB       = $vm.MemoryDemandMB
-                DynamicMemoryEnabled = $vm.DynamicMemoryEnabled
-                MemoryPressure       = $simMemPressure
-            }
+            $projected = & $simulateAndScore $vm $candidate
 
-            $projected   = Measure-VmHappiness -VmMetrics $simVmMetrics -HostMetrics $simHostMetrics `
-                                               -CpuWeight $CpuWeight -MemoryWeight $MemoryWeight
-            $improvement = $projected.HappinessScore - $score.HappinessScore
+            # Apply rule-aware score adjustments
+            $adjustedScore = $projected.HappinessScore
+            if ($impact.HasSoftViolation) { $adjustedScore = [Math]::Max(0,   $adjustedScore - $SoftRuleViolationPenalty) }
+            if ($impact.FixesViolation)   { $adjustedScore = [Math]::Min(100, $adjustedScore + $RuleComplianceBonus) }
+
+            $improvement = $adjustedScore - $score.HappinessScore
 
             if ($improvement -gt $bestImprovement) {
                 $bestImprovement = $improvement
@@ -164,6 +284,7 @@ function Find-MigrationCandidates {
                     MemHappinessBefore = $score.MemHappiness
                     CpuHappinessAfter  = [Math]::Round($projected.CpuHappiness, 1)
                     MemHappinessAfter  = [Math]::Round($projected.MemHappiness, 1)
+                    ComplianceReason   = $null
                 }
             }
         }
@@ -172,20 +293,7 @@ function Find-MigrationCandidates {
 
         $migrations.Add($bestMigration)
         [void]$scheduledVMs.Add($bestMigration.VMName)
-
-        # ── Update simulated state so subsequent iterations stay consistent ────
-        $src = $simNodes[$bestMigration.SourceNode]
-        $dst = $simNodes[$bestMigration.DestinationNode]
-
-        $srcCpuRelief = ($vm.CpuUtilization / 100.0) *
-                        ($vm.ProcessorCount / $src.LogicalProcessorCount) * 100.0
-        $dstCpuLoad   = ($vm.CpuUtilization / 100.0) *
-                        ($vm.ProcessorCount / $dst.LogicalProcessorCount) * 100.0
-
-        $src.CpuUtilization    = [Math]::Max(0.0,   $src.CpuUtilization   - $srcCpuRelief)
-        $src.AvailableMemoryMB = $src.AvailableMemoryMB + $vm.MemoryAssignedMB
-        $dst.CpuUtilization    = [Math]::Min(100.0, $dst.CpuUtilization   + $dstCpuLoad)
-        $dst.AvailableMemoryMB = $dst.AvailableMemoryMB - $vm.MemoryAssignedMB
+        & $applySimulatedMove $vm $bestMigration.SourceNode $bestMigration.DestinationNode
     }
 
     return $migrations

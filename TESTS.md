@@ -63,9 +63,12 @@ Invoke-Pester -Configuration $cfg
 ```
 Tests/
 ├── Helpers/
-│   └── New-TestObjects.ps1              # Shared builder functions for test data
-├── Measure-VmHappiness.Tests.ps1        # Unit tests for the happiness scoring algorithm
-└── Find-MigrationCandidates.Tests.ps1  # Unit tests for the migration planning logic
+│   └── New-TestObjects.ps1                   # Shared builder functions for test data
+├── Measure-VmHappiness.Tests.ps1             # Unit tests for the happiness scoring algorithm
+├── Find-MigrationCandidates.Tests.ps1        # Unit tests for the migration planning logic
+├── Get-MigrationRuleImpact.Tests.ps1         # Unit tests for per-migration rule impact evaluation
+├── Test-AffinityCompliance.Tests.ps1         # Unit tests for current-placement violation detection
+└── AffinityRules.Tests.ps1                   # Unit tests for CRUD operations on the rule store
 ```
 
 ### `Tests/Helpers/New-TestObjects.ps1`
@@ -183,6 +186,139 @@ Verifies all fields on the returned migration object: `VMName`, `VMId`, `SourceN
 
 - Two equally unhappy VMs on a source node; destination has memory for only one. After the first migration is planned and the simulated `AvailableMemoryMB` on the destination is decremented, the second VM is correctly excluded (post-migration free memory would fall below the reserve).
 - No VM appears in the migration list more than once.
+
+---
+
+### `Get-MigrationRuleImpact.Tests.ps1` — 18 tests
+
+Tests the rule-impact evaluation logic in `Functions/Private/Get-MigrationRuleImpact.ps1`. Given a proposed (VM, destination) pair and the current snapshot, the function simulates post-migration placement and classifies each affected rule as Break, Fix, or Neutral.
+
+**Empty / no-op cases** (3 tests)
+
+- Empty `RuleSet` → all-false result.
+- Null `RuleSet` → all-false result.
+- No rule references the migrating VM → all-false result.
+
+**VmVmAffinity** (4 tests)
+
+| Scenario | Expected |
+|---|---|
+| Moving VM off shared host (rule satisfied) | `HasHardViolation=true` |
+| Same move, non-enforced rule | `HasSoftViolation=true` |
+| Moving VM onto host where peers already reside (rule violated) | `FixesViolation=true` |
+| Moving to third node while rule is already violated | Neutral (all false) |
+
+**VmVmAntiAffinity** (4 tests)
+
+| Scenario | Expected |
+|---|---|
+| Moving VM onto host already running a peer (rule satisfied) | `HasHardViolation=true` |
+| Same move, non-enforced rule | `HasSoftViolation=true` |
+| Moving co-located VM to a unique host (rule violated) | `FixesViolation=true` |
+| Moving VM to empty node, rule already satisfied | Neutral |
+
+**VmHostAffinity** (3 tests)
+
+- Moving VM off allowed hosts → `HasHardViolation=true`.
+- Moving VM onto an allowed host (currently on non-allowed) → `FixesViolation=true`.
+- Moving between two allowed hosts → Neutral.
+
+**VmHostAntiAffinity** (3 tests)
+
+- Moving VM onto an excluded host → `HasHardViolation=true`.
+- Moving VM off an excluded host → `FixesViolation=true`.
+- Moving VM between two non-excluded hosts → Neutral.
+
+**Output object structure** (2 tests)
+
+- Result always contains all six properties (`HasHardViolation`, `HasSoftViolation`, `FixesViolation`, `HardReasons`, `SoftReasons`, `FixReasons`).
+- `HardReasons` is non-empty when `HasHardViolation` is true; `SoftReasons` is empty.
+
+---
+
+### `Test-AffinityCompliance.Tests.ps1` — 16 tests
+
+Tests current-placement violation detection in `Functions/Private/Test-AffinityCompliance.ps1`. Given a snapshot and rule set, it returns one violation record per broken rule instance.
+
+**No-op cases** (3 tests)
+
+- Empty or null `RuleSet` → empty result.
+- Rules whose VMs are all offline (not in snapshot) → skipped.
+
+**VmVmAffinity** (3 tests)
+
+- Co-located group → no violation.
+- Group split across two nodes → one violation containing both VMs.
+- Offline member ignored; online members on same node → no violation.
+
+**VmVmAntiAffinity** (3 tests)
+
+- All VMs on separate nodes → no violation.
+- Two VMs co-located → one violation listing both.
+- Two separate conflicting pairs → two violations.
+
+**VmHostAffinity** (2 tests)
+
+- VM on an allowed host → no violation.
+- VM on a non-allowed host → one violation per offending VM.
+
+**VmHostAntiAffinity** (2 tests)
+
+- VM not on any excluded host → no violation.
+- VM on an excluded host → one violation.
+
+**Output fields** (3 tests)
+
+- Each violation record contains `RuleId`, `RuleName`, `Type`, `Enforced`, `VMs`, `Description`.
+- `Enforced` flag mirrors the source rule for both hard and soft rules.
+
+---
+
+### `AffinityRules.Tests.ps1` — 26 tests
+
+Tests the public CRUD functions in `Functions/Public/AffinityRules.ps1` using a per-test temporary JSON file so the real rule store at `$env:ProgramData\HvDRS\rules.json` is never touched.
+
+**Add-HvDRSAffinityRule** (8 tests)
+
+| Scenario | Verified |
+|---|---|
+| Create a VmVmAffinity rule | Rule persisted, Name and Type correct |
+| New rule gets a unique GUID | `RuleId` parseable as `[System.Guid]` |
+| Default `Enforced` is `$false` | Confirmed without `-Enforced` switch |
+| `-Enforced` switch sets `$true` | Confirmed |
+| VmVmAffinity with fewer than 2 VMs | Throws |
+| VmHostAffinity with no `-Hosts` | Throws |
+| Duplicate name | Warning emitted, second rule not stored |
+| Multiple rules stored correctly | Count = 2 |
+| `-WhatIf` | No file created |
+
+**Get-HvDRSAffinityRule** (7 tests)
+
+- Returns all rules (no filter).
+- Filters by exact `Name`.
+- Supports wildcards in `Name`.
+- Filters by `Type`.
+- Filters by `VmName`.
+- Filters by `RuleId`.
+- Returns empty array when no rules match.
+
+**Remove-HvDRSAffinityRule** (4 tests)
+
+- Removes by `Name`; remaining rules intact.
+- Removes by `RuleId`.
+- Non-existent name → warning, no error, count unchanged.
+- `-WhatIf` → no removal.
+
+**Set-HvDRSAffinityRule** (7 tests)
+
+- `-NewName` renames the rule.
+- `-Description` replaces description text.
+- `-Enforced $true` sets enforcement.
+- `-AddVMs` appends without duplicating.
+- `-RemoveVMs` removes listed members.
+- Removing members below minimum count → throws.
+- Unknown `RuleId` → warning, no change.
+- `-WhatIf` → no change persisted.
 
 ---
 

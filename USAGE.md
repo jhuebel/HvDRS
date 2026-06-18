@@ -24,6 +24,9 @@ Invoke-HvDRS
     [-MemoryWeight <Single>]
     [-MaxDestinationNetworkUtil <Single>]
     [-DestinationMemoryReserveMB <Int32>]
+    [-RulesPath <String>]
+    [-SoftRuleViolationPenalty <Single>]
+    [-RuleComplianceBonus <Single>]
     [-RecommendOnly]
     [-MaintenanceLockFile <String>]
     [-WhatIf]
@@ -42,6 +45,9 @@ Invoke-HvDRS
 | `-MemoryWeight` | Float (0–1) | 0.5 | Memory happiness weight in combined score |
 | `-MaxDestinationNetworkUtil` | Float (0–100) | 70.0 | NIC utilization % above which a node is excluded as a migration target |
 | `-DestinationMemoryReserveMB` | Int | 512 | Free memory (MB) that must remain on destination after migration |
+| `-RulesPath` | String | `$env:ProgramData\HvDRS\rules.json` | Path to the affinity/anti-affinity rule store; rule checking is skipped if the file does not exist |
+| `-SoftRuleViolationPenalty` | Float (0–100) | 25.0 | Score penalty applied when a proposed move would break a soft rule |
+| `-RuleComplianceBonus` | Float (0–100) | 25.0 | Score bonus applied when a proposed move would fix an existing soft rule violation |
 | `-RecommendOnly` | Switch | — | Print recommendations but never execute migrations |
 | `-MaintenanceLockFile` | String | `$env:ProgramData\HvDRS\maintenance.lock` | Path to the maintenance lock file checked each pass |
 | `-WhatIf` | Switch | — | Standard PowerShell dry-run; shows what would be done |
@@ -214,18 +220,143 @@ Scores are always sorted ascending (most unhappy first) so problems are immediat
 | 50–79 | Uncomfortable |
 | 0–49 | UNHAPPY |
 
-### 3. Migration Recommendations
+### 3. Rule Violation Summary (if rules are configured)
+
+When affinity rules are loaded, a violation table is printed before the VM scores:
+
+```
+── 1 Rule Violation(s) Detected — 1 hard, 0 soft ────────────────────────────
+
+Rule        Type               Hard  VMs         Detail
+----        ----               ----  ---         ------
+DC-Anti     VmVmAntiAffinity   True  DC1, DC2    Anti-affinity rule 'DC-Anti': 'DC1', 'DC2' co-located on 'HV-NODE1'
+```
+
+### 4. Migration Recommendations
+
+The `Trigger` column shows whether each migration was driven by rule compliance or by happiness scoring:
 
 ```
 ── 2 Migration Recommendation(s) ─────────────────────────────────────────────
 
-VM       From      To        Score Before  Score After  Delta  CPU Δ         Mem Δ
---       ----      --        ------------  -----------  -----  -----         -----
-WEB-01   HV-NODE1  HV-NODE2            36         82.1  +46.1  0.0 → 100.0  72.0 → 72.0
-WEB-02   HV-NODE1  HV-NODE3            46         78.4  +32.4  4.3 → 98.1   88.0 → 88.0
+VM     From      To        Score Before  Score After  Delta   CPU Δ          Mem Δ          Trigger
+--     ----      --        ------------  -----------  -----   -----          -----          -------
+DC1    HV-NODE1  HV-NODE2            88         90.0  +2.0   100.0 → 100.0  88.0 → 88.0   Compliance: Anti-affinity rule 'DC-Anti': ...
+WEB-01 HV-NODE1  HV-NODE3            36         82.1  +46.1  0.0 → 100.0   72.0 → 72.0   Happiness
 ```
 
+Compliance migrations appear first in the plan and are executed regardless of happiness threshold — they fix hard-rule violations. Happiness migrations follow and obey the normal aggression-level thresholds.
+
 When running without `-WhatIf` or `-RecommendOnly`, migrations execute immediately after the table is printed.
+
+---
+
+## Affinity and Anti-Affinity Rules
+
+HvDRS supports four rule types that constrain where VMs may run. Rules are stored in a JSON file (default: `$env:ProgramData\HvDRS\rules.json`) and are automatically loaded by `Invoke-HvDRS` each pass.
+
+| Rule Type | Effect |
+|---|---|
+| `VmVmAffinity` | Keep the listed VMs on the same host |
+| `VmVmAntiAffinity` | Keep the listed VMs on different hosts |
+| `VmHostAffinity` | Run the listed VMs only on the specified hosts |
+| `VmHostAntiAffinity` | Never run the listed VMs on the specified hosts |
+
+### Hard vs soft rules
+
+Add `-Enforced` when creating a rule to make it **hard**:
+
+- **Hard rule**: HvDRS will *never* execute a migration that would break it, and will proactively schedule compliance migrations to fix existing violations.
+- **Soft rule** (default): violations lower the candidate score by `-SoftRuleViolationPenalty` (default: 25 pts), but the migration is not blocked.
+
+### Managing rules
+
+#### Add a rule
+
+```powershell
+# Hard anti-affinity — domain controllers must never share a host
+Add-HvDRSAffinityRule -Name 'DC Anti-Affinity' -Type VmVmAntiAffinity `
+                      -VMs 'DC-01','DC-02' -Enforced
+
+# Soft affinity — web tier VMs prefer to be together
+Add-HvDRSAffinityRule -Name 'Web Tier Affinity' -Type VmVmAffinity `
+                      -VMs 'WEB-01','WEB-02','WEB-03'
+
+# Hard host affinity — SQL licensed only on nodes with SQL SA coverage
+Add-HvDRSAffinityRule -Name 'SQL Licensing' -Type VmHostAffinity `
+                      -VMs 'SQL-PROD-01' -Hosts 'HV-NODE1','HV-NODE2' -Enforced
+
+# Hard host anti-affinity — dev VMs must never run on production nodes
+Add-HvDRSAffinityRule -Name 'Dev Isolation' -Type VmHostAntiAffinity `
+                      -VMs 'DEV-01','DEV-02' -Hosts 'HV-NODE1','HV-NODE2' -Enforced
+```
+
+#### List rules
+
+```powershell
+# All rules
+Get-HvDRSAffinityRule
+
+# Filter by type
+Get-HvDRSAffinityRule -Type VmVmAntiAffinity
+
+# Rules referencing a specific VM
+Get-HvDRSAffinityRule -VmName 'SQL-PROD-01'
+
+# Wildcard name search
+Get-HvDRSAffinityRule -Name 'DC*'
+```
+
+#### Modify a rule
+
+```powershell
+$id = (Get-HvDRSAffinityRule -Name 'Web Tier Affinity').RuleId
+
+# Add a VM to the group
+Set-HvDRSAffinityRule -RuleId $id -AddVMs 'WEB-04'
+
+# Promote from soft to hard
+Set-HvDRSAffinityRule -RuleId $id -Enforced $true
+
+# Rename
+Set-HvDRSAffinityRule -RuleId $id -NewName 'Web Tier Co-location'
+```
+
+#### Remove a rule
+
+```powershell
+Remove-HvDRSAffinityRule -Name 'DC Anti-Affinity'
+# or by ID
+Remove-HvDRSAffinityRule -RuleId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+```
+
+#### Check current compliance
+
+```powershell
+Test-HvDRSAffinityCompliance -ClusterName 'PROD-CLUSTER'
+```
+
+This collects a live snapshot and prints any violated rules without executing any migrations. It returns the violation objects so you can pipe them for further processing.
+
+### How rules integrate with Invoke-HvDRS
+
+Each `Invoke-HvDRS` pass runs two migration planning passes:
+
+1. **Compliance pass** — scans for hard-rule violations and generates proactive migrations to fix them. These appear first in the plan with `Trigger: Compliance: <reason>`.
+2. **Happiness pass** — scores each unhappy VM's candidate destinations, applying a penalty for soft-rule breaks and a bonus for soft-rule fixes, then selects the net-best option.
+
+Hard-rule checks block any happiness-based migration that would create a new violation, regardless of how much happiness improvement it would deliver.
+
+### Using a custom rule file
+
+```powershell
+# Manage rules in a project-specific file
+Add-HvDRSAffinityRule -Name 'App Affinity' -Type VmVmAffinity `
+                      -VMs 'APP-01','APP-02' -RulesPath D:\Config\my-rules.json
+
+# Run HvDRS against the same file
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -RulesPath D:\Config\my-rules.json
+```
 
 ---
 

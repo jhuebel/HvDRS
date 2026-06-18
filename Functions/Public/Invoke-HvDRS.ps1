@@ -1,7 +1,8 @@
 function Invoke-HvDRS {
     <#
     .SYNOPSIS
-        Hyper-V Distributed Resource Scheduler — balances a Failover Cluster using a VM Happiness metric.
+        Hyper-V Distributed Resource Scheduler — balances a Failover Cluster using a VM Happiness metric,
+        with optional affinity / anti-affinity rule enforcement.
 
     .DESCRIPTION
         Inspired by VMware's per-VM happiness model (vSphere 7+ DRS), this function:
@@ -9,11 +10,13 @@ function Invoke-HvDRS {
           1. Snapshots CPU, memory, and network utilization across all cluster nodes.
           2. Scores each running VM on a 0–100 Happiness scale based on whether
              it is receiving the CPU and memory resources it demands.
-          3. Identifies VMs below the aggression-level happiness threshold.
-          4. Selects destination nodes using a Network-Aware filter: nodes whose
+          3. Loads affinity / anti-affinity rules and checks current placement for
+             violations; enforced (hard) rule violations are remediated first.
+          4. Identifies VMs below the aggression-level happiness threshold.
+          5. Selects destination nodes using a Network-Aware filter: nodes whose
              NIC utilization exceeds -MaxDestinationNetworkUtil are excluded.
-          5. Recommends or executes Live Migrations via Move-ClusterVirtualMachineRole,
-             respecting cluster possible-owner constraints.
+          6. Recommends or executes Live Migrations via Move-ClusterVirtualMachineRole,
+             respecting cluster possible-owner constraints and affinity rules.
 
         Use -WhatIf to preview recommendations without migrating anything.
 
@@ -52,6 +55,19 @@ function Invoke-HvDRS {
         Minimum free memory (MB) that must remain on the destination after the VM lands
         (default: 512 MB).
 
+    .PARAMETER RulesPath
+        Path to the JSON affinity rule store. If the file does not exist, rule checking
+        is skipped. Default: $env:ProgramData\HvDRS\rules.json.
+        Manage rules with Add-HvDRSAffinityRule / Get-HvDRSAffinityRule / etc.
+
+    .PARAMETER SoftRuleViolationPenalty
+        Score penalty (0–100) applied to the projected happiness of a VM when a proposed
+        migration would break a soft affinity rule (default: 25).
+
+    .PARAMETER RuleComplianceBonus
+        Score bonus (0–100) added to the projected happiness when a migration would fix
+        an existing soft rule violation (default: 25).
+
     .PARAMETER RecommendOnly
         Collect metrics, score VMs, and print recommendations — but never execute migrations.
         Useful when scheduling periodic monitoring passes that should not trigger live migrations.
@@ -84,8 +100,8 @@ function Invoke-HvDRS {
         Disable-HvDRSMaintenance -ClusterName 'PROD-CLUSTER'
 
     .EXAMPLE
-        # Weight memory pressure more heavily than CPU
-        Invoke-HvDRS -CpuWeight 0.3 -MemoryWeight 0.7
+        # Weight memory pressure more heavily than CPU, use a custom rules file
+        Invoke-HvDRS -CpuWeight 0.3 -MemoryWeight 0.7 -RulesPath D:\config\hvdrs-rules.json
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
@@ -108,6 +124,14 @@ function Invoke-HvDRS {
         [float]$MaxDestinationNetworkUtil = 70.0,
 
         [int]$DestinationMemoryReserveMB = 512,
+
+        [string]$RulesPath = (Join-Path $env:ProgramData 'HvDRS\rules.json'),
+
+        [ValidateRange(0.0, 100.0)]
+        [float]$SoftRuleViolationPenalty = 25.0,
+
+        [ValidateRange(0.0, 100.0)]
+        [float]$RuleComplianceBonus = 25.0,
 
         [switch]$RecommendOnly,
 
@@ -138,8 +162,12 @@ function Invoke-HvDRS {
         'AUTO-MIGRATE'
     }
 
-    Write-Host ("{0} HvDRS starting — Cluster: {1}  Aggression: {2}  Network gate: {3}%  Mode: {4}" -f
-        (& $ts), $ClusterName, $AggressionLevel, $MaxDestinationNetworkUtil, $modeLabel)
+    # ── Load affinity rules ────────────────────────────────────────────────────
+    $ruleSet   = Get-AffinityRuleSet -Path $RulesPath
+    $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
+
+    Write-Host ("{0} HvDRS starting — Cluster: {1}  Aggression: {2}  Network gate: {3}%  Rules: {4}  Mode: {5}" -f
+        (& $ts), $ClusterName, $AggressionLevel, $MaxDestinationNetworkUtil, $ruleLabel, $modeLabel)
 
     if ($maintenanceActive) {
         Write-Host ("{0} Maintenance lock active ({1}). Metrics will be collected and scored but no migrations will run." -f
@@ -169,7 +197,29 @@ function Invoke-HvDRS {
         @{ N='Net %';    E={ '{0:N1}' -f $_.NetworkUtilization } },
         @{ N='VMs';      E={ $_.VMs.Count } }
 
-    # ── Phase 2: Score all VMs ─────────────────────────────────────────────────
+    # ── Phase 2: Check affinity rule compliance ────────────────────────────────
+    if ($ruleSet.Count -gt 0) {
+        $violations = @(Test-AffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet)
+
+        if ($violations.Count -gt 0) {
+            $hardCount = @($violations | Where-Object { $_.Enforced }).Count
+            $softCount = $violations.Count - $hardCount
+
+            Write-Host ('── {0} Rule Violation(s) Detected — {1} hard, {2} soft ──────────────────────────' -f
+                $violations.Count, $hardCount, $softCount)
+
+            $violations | Format-Table -AutoSize -Wrap -Property `
+                @{ N='Rule';     E={ $_.RuleName } },
+                @{ N='Type';     E={ $_.Type } },
+                @{ N='Hard';     E={ $_.Enforced } },
+                @{ N='VMs';      E={ $_.VMs -join ', ' } },
+                @{ N='Detail';   E={ $_.Description } }
+        } else {
+            Write-Host ("{0} All {1} affinity rule(s) satisfied." -f (& $ts), $ruleSet.Count)
+        }
+    }
+
+    # ── Phase 3: Score all VMs ─────────────────────────────────────────────────
     $allScores = foreach ($vm in $snapshot.VMs) {
         $hostMetrics = $snapshot.Nodes | Where-Object { $_.NodeName -eq $vm.HostNode }
         if (-not $hostMetrics) { continue }
@@ -179,24 +229,27 @@ function Invoke-HvDRS {
 
     Write-Host '── VM Happiness Scores ───────────────────────────────────────────────────────'
     $allScores | Sort-Object HappinessScore | Format-Table -AutoSize -Property `
-        @{ N='VM';            E={ $_.VMName } },
-        @{ N='Host';          E={ $_.HostNode } },
-        @{ N='CPU Happy';     E={ '{0:N1}' -f $_.CpuHappiness } },
-        @{ N='Mem Happy';     E={ '{0:N1}' -f $_.MemHappiness } },
-        @{ N='Score';         E={ '{0:N1}' -f $_.HappinessScore } },
-        @{ N='Status';        E={
+        @{ N='VM';        E={ $_.VMName } },
+        @{ N='Host';      E={ $_.HostNode } },
+        @{ N='CPU Happy'; E={ '{0:N1}' -f $_.CpuHappiness } },
+        @{ N='Mem Happy'; E={ '{0:N1}' -f $_.MemHappiness } },
+        @{ N='Score';     E={ '{0:N1}' -f $_.HappinessScore } },
+        @{ N='Status';    E={
             if    ($_.HappinessScore -ge 80) { 'Happy' }
             elseif ($_.HappinessScore -ge 50) { 'Uncomfortable' }
             else                             { 'UNHAPPY' }
         }}
 
-    # ── Phase 3: Find migration candidates ────────────────────────────────────
+    # ── Phase 4: Find migration candidates ────────────────────────────────────
     $migrations = Find-MigrationCandidates -Snapshot $snapshot `
                                            -AggressionLevel $AggressionLevel `
                                            -CpuWeight $CpuWeight `
                                            -MemoryWeight $MemoryWeight `
                                            -MaxDestinationNetworkUtil $MaxDestinationNetworkUtil `
                                            -DestinationMemoryReserveMB $DestinationMemoryReserveMB `
+                                           -RuleSet $ruleSet `
+                                           -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
+                                           -RuleComplianceBonus $RuleComplianceBonus `
                                            -ClusterName $ClusterName `
                                            -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
@@ -208,7 +261,7 @@ function Invoke-HvDRS {
 
     Write-Host ''
     Write-Host ('── {0} Migration Recommendation(s) ─────────────────────────────────────────' -f $migrations.Count)
-    $migrations | Format-Table -AutoSize -Property `
+    $migrations | Format-Table -AutoSize -Wrap -Property `
         @{ N='VM';           E={ $_.VMName } },
         @{ N='From';         E={ $_.SourceNode } },
         @{ N='To';           E={ $_.DestinationNode } },
@@ -216,9 +269,14 @@ function Invoke-HvDRS {
         @{ N='Score After';  E={ $_.ProjectedScore } },
         @{ N='Delta';        E={ '+{0}' -f $_.Improvement } },
         @{ N='CPU Δ';        E={ '{0} → {1}' -f $_.CpuHappinessBefore, $_.CpuHappinessAfter } },
-        @{ N='Mem Δ';        E={ '{0} → {1}' -f $_.MemHappinessBefore, $_.MemHappinessAfter } }
+        @{ N='Mem Δ';        E={ '{0} → {1}' -f $_.MemHappinessBefore, $_.MemHappinessAfter } },
+        @{ N='Trigger';      E={
+            if ($_.ComplianceReason) {
+                'Compliance: ' + ($_.ComplianceReason.Substring(0, [Math]::Min(40, $_.ComplianceReason.Length)))
+            } else { 'Happiness' }
+        }}
 
-    # ── Phase 4: Execute (or preview) migrations ───────────────────────────────
+    # ── Phase 5: Execute (or preview) migrations ───────────────────────────────
     if (-not $willMigrate) {
         $reason = if ($maintenanceActive) { 'maintenance lock is active' } else { '-RecommendOnly was specified' }
         Write-Host ("{0} Skipping migration execution — {1}." -f (& $ts), $reason)
@@ -232,16 +290,17 @@ function Invoke-HvDRS {
     $failed    = 0
 
     foreach ($migration in $migrations) {
-        $action = "Live-migrate '{0}' from '{1}' to '{2}' (happiness {3} → {4})" -f
-                  $migration.VMName, $migration.SourceNode, $migration.DestinationNode,
-                  $migration.CurrentScore, $migration.ProjectedScore
+        $trigger = if ($migration.ComplianceReason) { "rule compliance" } else { "happiness" }
+        $action  = "Live-migrate '{0}' from '{1}' to '{2}' [{3}; score {4} → {5}]" -f
+                   $migration.VMName, $migration.SourceNode, $migration.DestinationNode,
+                   $trigger, $migration.CurrentScore, $migration.ProjectedScore
 
         if (-not $PSCmdlet.ShouldProcess($migration.VMName, $action)) {
             continue  # -WhatIf: ShouldProcess prints the action and skips the body
         }
 
-        Write-Host ("{0} Migrating '{1}': {2} → {3} ..." -f
-            (& $ts), $migration.VMName, $migration.SourceNode, $migration.DestinationNode)
+        Write-Host ("{0} Migrating '{1}': {2} → {3} [{4}] ..." -f
+            (& $ts), $migration.VMName, $migration.SourceNode, $migration.DestinationNode, $trigger)
 
         try {
             Move-ClusterVirtualMachineRole `
