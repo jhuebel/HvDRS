@@ -27,7 +27,7 @@ The account used to run HVDRS (interactively or as a scheduled task) requires:
 - **Cluster administrative rights** — member of the local Administrators group on all cluster nodes, or granted cluster Full Control in Failover Cluster Manager
 - **Live Migration permission** — granted by default to cluster administrators
 - **WinRM access** — PowerShell remoting must be enabled on all nodes (`Enable-PSRemoting`)
-- **Performance counter access** — local Administrators or Performance Monitor Users group on each node
+- **Performance counter access** — local Administrators or Performance Monitor Users group on each node (required for CPU, memory, network, and CSV I/O counters)
 
 ### Network Requirements
 
@@ -80,13 +80,9 @@ Get-Command -Module HVDRS
 
 # Confirm WinRM is reachable on each node
 Get-ClusterNode -Cluster 'YOUR-CLUSTER' | ForEach-Object {
-    Test-WSMan -ComputerName $_.Name -ErrorAction SilentlyContinue |
-        Select-Object @{N='Node';E={$_.ProductVendor -replace '.*',''}},
-                      @{N='Name';E={$_.Name}} |
-        Out-Null
     [PSCustomObject]@{
-        Node      = $_.Name
-        WinRM     = if (Test-WSMan -ComputerName $_.Name -ErrorAction SilentlyContinue) { 'OK' } else { 'FAIL' }
+        Node  = $_.Name
+        WinRM = if (Test-WSMan -ComputerName $_.Name -ErrorAction SilentlyContinue) { 'OK' } else { 'FAIL' }
     }
 }
 ```
@@ -99,9 +95,13 @@ HVDRS creates one directory on the host where it runs:
 
 | Path | Purpose |
 |---|---|
-| `$env:ProgramData\HvDRS\` | Maintenance lock file storage |
+| `$env:ProgramData\HvDRS\` | Data directory created automatically on first use |
+| `$env:ProgramData\HvDRS\maintenance.lock` | Maintenance lock file; presence suspends all migrations |
+| `$env:ProgramData\HvDRS\rules.json` | Affinity / anti-affinity rule store; shared across all clusters, rules scoped by cluster name |
 
-This directory is created automatically by `Enable-HvDRSMaintenance`. No manual setup is needed.
+These files are created automatically as needed. No manual setup is required.
+
+> **Tip:** You can use a custom path for the rule store by passing `-RulesPath` to any affinity rule function or to `Invoke-HvDRS`. This is useful when managing multiple separate clusters from one management host.
 
 ---
 
@@ -109,7 +109,7 @@ This directory is created automatically by `Enable-HvDRSMaintenance`. No manual 
 
 For production use, deploy HVDRS as a scheduled task on one cluster node (or on a dedicated management host with cluster admin rights).
 
-### Create the scheduled task
+### Create the compute DRS scheduled task
 
 ```powershell
 $action = New-ScheduledTaskAction `
@@ -130,6 +130,26 @@ Register-ScheduledTask `
     -Trigger    $trigger `
     -Principal  $principal `
     -Description 'Hyper-V DRS — rebalances cluster VMs every 15 minutes'
+```
+
+### Create the storage DRS scheduled task
+
+Storage rebalancing runs less frequently than compute rebalancing. Once per hour is typical for most environments:
+
+```powershell
+$storageAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument '-NonInteractive -WindowStyle Hidden -Command "Import-Module HVDRS; Invoke-HvStorageDRS -ClusterName ''PROD-CLUSTER''"'
+
+$storageTrigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Hours 1) -Once -At (Get-Date)
+
+Register-ScheduledTask `
+    -TaskName   'HvDRS Storage Balancing Pass' `
+    -TaskPath   '\HvDRS\' `
+    -Action     $storageAction `
+    -Trigger    $storageTrigger `
+    -Principal  $principal `
+    -Description 'Hyper-V Storage DRS — rebalances CSV utilization every hour'
 ```
 
 ### Recommend-Only monitoring task (no migrations)
@@ -160,3 +180,5 @@ Register-ScheduledTask `
 2. Run a `-WhatIf` pass to confirm expected behavior against your cluster.
 3. Replace the installed module folder: `Copy-Item -Recurse -Force .\HVDRS "C:\Program Files\WindowsPowerShell\Modules\HVDRS"`
 4. Restart any long-running PowerShell sessions that had the old module loaded.
+
+The data directory and rule store at `$env:ProgramData\HvDRS\` are not modified during an upgrade.

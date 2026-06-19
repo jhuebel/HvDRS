@@ -10,7 +10,7 @@ Import-Module HVDRS
 
 ## Invoke-HvDRS
 
-The primary function. Collects cluster metrics, scores VM happiness, and optionally executes live migrations.
+The primary compute balancing function. Collects cluster metrics, scores VM happiness, checks affinity rule compliance, and optionally executes live migrations.
 
 ### Syntax
 
@@ -129,7 +129,7 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -SampleCount 10 -SampleIntervalSeconds 
 
 ## Maintenance Mode
 
-Maintenance mode suspends all migration execution without modifying Task Scheduler or the scheduled task action. Drop the lock file to pause; delete it to resume.
+Maintenance mode suspends all migration execution — for both `Invoke-HvDRS` and `Invoke-HvStorageDRS` — without modifying Task Scheduler or the scheduled task action. Drop the lock file to pause; delete it to resume.
 
 ### Enable maintenance mode
 
@@ -145,7 +145,7 @@ HvDRS maintenance mode ENABLED.
   Run Disable-HvDRSMaintenance to resume automatic migrations.
 ```
 
-While the lock file is present, `Invoke-HvDRS` still runs its full collection and scoring pass but prints:
+While the lock file is present, `Invoke-HvDRS` and `Invoke-HvStorageDRS` still run their full collection and scoring passes but print:
 
 ```
 [14:32:01] Maintenance lock active (C:\ProgramData\HvDRS\maintenance.lock). Metrics will be collected and scored but no migrations will run.
@@ -182,9 +182,9 @@ Enable-HvDRSMaintenance -Reason 'Test' -WhatIf
 
 ---
 
-## Understanding the Output
+## Understanding Invoke-HvDRS Output
 
-A typical `Invoke-HvDRS` run produces three sections:
+A typical `Invoke-HvDRS` run produces four sections:
 
 ### 1. Node Summary
 
@@ -198,29 +198,7 @@ HV-NODE2  31.2  49152 MB  38912 MB     4.1    4
 HV-NODE3  42.8  61440 MB  26624 MB     6.7    6
 ```
 
-### 2. VM Happiness Scores
-
-```
-── VM Happiness Scores ───────────────────────────────────────────────────────
-
-VM            Host      CPU Happy  Mem Happy  Score  Status
---            ----      ---------  ---------  -----  ------
-SQL-PROD-01   HV-NODE1       21.4       85.0   53.2  Uncomfortable
-WEB-01        HV-NODE1        0.0       72.0   36.0  UNHAPPY
-WEB-02        HV-NODE1        4.3       88.0   46.2  Uncomfortable
-APP-01        HV-NODE2      100.0      100.0  100.0  Happy
-DB-DEV-01     HV-NODE3       95.0       95.0   95.0  Happy
-```
-
-Scores are always sorted ascending (most unhappy first) so problems are immediately visible.
-
-| Score range | Status label |
-|---|---|
-| 80–100 | Happy |
-| 50–79 | Uncomfortable |
-| 0–49 | UNHAPPY |
-
-### 3. Rule Violation Summary (if rules are configured)
+### 2. Rule Violation Summary (if rules are configured)
 
 When affinity rules are loaded, a violation table is printed before the VM scores:
 
@@ -231,6 +209,28 @@ Rule        Type               Hard  VMs         Detail
 ----        ----               ----  ---         ------
 DC-Anti     VmVmAntiAffinity   True  DC1, DC2    Anti-affinity rule 'DC-Anti': 'DC1', 'DC2' co-located on 'HV-NODE1'
 ```
+
+### 3. VM Happiness Scores
+
+```
+── VM Happiness Scores ───────────────────────────────────────────────────────
+
+VM            Host      CPU Happy  Mem Happy  Score  Status
+--            ----      ---------  ---------  -----  ------
+WEB-01        HV-NODE1        0.0       72.0   36.0  UNHAPPY
+WEB-02        HV-NODE1        4.3       88.0   46.2  Uncomfortable
+SQL-PROD-01   HV-NODE1       21.4       85.0   53.2  Uncomfortable
+DB-DEV-01     HV-NODE3       95.0       95.0   95.0  Happy
+APP-01        HV-NODE2      100.0      100.0  100.0  Happy
+```
+
+Scores are always sorted ascending (most unhappy first) so problems are immediately visible.
+
+| Score range | Status label |
+|---|---|
+| 80–100 | Happy |
+| 50–79 | Uncomfortable |
+| 0–49 | UNHAPPY |
 
 ### 4. Migration Recommendations
 
@@ -288,7 +288,7 @@ Invoke-HvStorageDRS
 | `-WhatIf` | Switch | — | Standard PowerShell dry-run |
 | `-Verbose` | Switch | — | Shows per-CSV counter collection progress |
 
-### CSV Happiness scoring
+### CSV Happiness Scoring
 
 **Space happiness** — based on free space percentage:
 
@@ -307,7 +307,7 @@ Invoke-HvStorageDRS
 | 5–20 ms | 100 − (lat − 5) × 6.67 |
 | > 20 ms | 0 |
 
-### Common scenarios
+### Common Scenarios
 
 ```powershell
 # Dry run — see what would be moved
@@ -335,7 +335,7 @@ Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER'
 
 Both honour the same maintenance lock file, so `Enable-HvDRSMaintenance` suspends both.
 
-### Understanding the output
+### Understanding the Output
 
 A typical run produces three sections:
 
@@ -366,7 +366,7 @@ APP-01  HV-NODE1  Volume1   Volume2   200.0   4.6 → 38.7   75.5 → 65.2  103 
 
 ## Affinity and Anti-Affinity Rules
 
-HvDRS supports four rule types that constrain where VMs may run. Rules are stored in a JSON file (default: `$env:ProgramData\HvDRS\rules.json`) and are automatically loaded by `Invoke-HvDRS` each pass.
+HvDRS supports four rule types that constrain where VMs may run. Rules are stored in a shared JSON file (default: `$env:ProgramData\HvDRS\rules.json`) and automatically loaded by `Invoke-HvDRS` each pass. Rules are **scoped per cluster** — the shared file can hold rules for multiple clusters without interference.
 
 | Rule Type | Effect |
 |---|---|
@@ -375,55 +375,66 @@ HvDRS supports four rule types that constrain where VMs may run. Rules are store
 | `VmHostAffinity` | Run the listed VMs only on the specified hosts |
 | `VmHostAntiAffinity` | Never run the listed VMs on the specified hosts |
 
-### Hard vs soft rules
+### Hard vs Soft Rules
 
 Add `-Enforced` when creating a rule to make it **hard**:
 
 - **Hard rule**: HvDRS will *never* execute a migration that would break it, and will proactively schedule compliance migrations to fix existing violations.
 - **Soft rule** (default): violations lower the candidate score by `-SoftRuleViolationPenalty` (default: 25 pts), but the migration is not blocked.
 
-### Managing rules
+### Managing Rules
 
 #### Add a rule
 
+The `-ClusterName` parameter scopes each rule to a specific cluster. If omitted, HVDRS detects the local cluster automatically.
+
 ```powershell
 # Hard anti-affinity — domain controllers must never share a host
-Add-HvDRSAffinityRule -Name 'DC Anti-Affinity' -Type VmVmAntiAffinity `
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' `
+                      -Name 'DC Anti-Affinity' -Type VmVmAntiAffinity `
                       -VMs 'DC-01','DC-02' -Enforced
 
 # Soft affinity — web tier VMs prefer to be together
-Add-HvDRSAffinityRule -Name 'Web Tier Affinity' -Type VmVmAffinity `
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' `
+                      -Name 'Web Tier Affinity' -Type VmVmAffinity `
                       -VMs 'WEB-01','WEB-02','WEB-03'
 
 # Hard host affinity — SQL licensed only on nodes with SQL SA coverage
-Add-HvDRSAffinityRule -Name 'SQL Licensing' -Type VmHostAffinity `
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' `
+                      -Name 'SQL Licensing' -Type VmHostAffinity `
                       -VMs 'SQL-PROD-01' -Hosts 'HV-NODE1','HV-NODE2' -Enforced
 
 # Hard host anti-affinity — dev VMs must never run on production nodes
-Add-HvDRSAffinityRule -Name 'Dev Isolation' -Type VmHostAntiAffinity `
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' `
+                      -Name 'Dev Isolation' -Type VmHostAntiAffinity `
                       -VMs 'DEV-01','DEV-02' -Hosts 'HV-NODE1','HV-NODE2' -Enforced
 ```
 
 #### List rules
 
 ```powershell
-# All rules
+# All rules for a specific cluster
+Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER'
+
+# All rules across all clusters (omit -ClusterName)
 Get-HvDRSAffinityRule
 
-# Filter by type
-Get-HvDRSAffinityRule -Type VmVmAntiAffinity
+# Filter by type (within a cluster)
+Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Type VmVmAntiAffinity
 
 # Rules referencing a specific VM
-Get-HvDRSAffinityRule -VmName 'SQL-PROD-01'
+Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -VmName 'SQL-PROD-01'
 
 # Wildcard name search
-Get-HvDRSAffinityRule -Name 'DC*'
+Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'DC*'
 ```
 
 #### Modify a rule
 
+Rules are modified by `RuleId` (a GUID). The `RuleId` is globally unique so no cluster scoping is needed for updates.
+
 ```powershell
-$id = (Get-HvDRSAffinityRule -Name 'Web Tier Affinity').RuleId
+$id = (Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'Web Tier Affinity').RuleId
 
 # Add a VM to the group
 Set-HvDRSAffinityRule -RuleId $id -AddVMs 'WEB-04'
@@ -438,8 +449,10 @@ Set-HvDRSAffinityRule -RuleId $id -NewName 'Web Tier Co-location'
 #### Remove a rule
 
 ```powershell
-Remove-HvDRSAffinityRule -Name 'DC Anti-Affinity'
-# or by ID
+# Remove by name, scoped to a cluster (safe when the same name exists in multiple clusters)
+Remove-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'DC Anti-Affinity'
+
+# Remove by globally-unique RuleId (no cluster scoping required)
 Remove-HvDRSAffinityRule -RuleId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 ```
 
@@ -451,7 +464,35 @@ Test-HvDRSAffinityCompliance -ClusterName 'PROD-CLUSTER'
 
 This collects a live snapshot and prints any violated rules without executing any migrations. It returns the violation objects so you can pipe them for further processing.
 
-### How rules integrate with Invoke-HvDRS
+### Per-Cluster Scoping
+
+Rules for different clusters coexist in the same JSON file without interference. This allows a single management host to maintain rules for multiple clusters:
+
+```powershell
+# Rules for PROD-CLUSTER
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'DC Anti-Affinity' `
+                      -Type VmVmAntiAffinity -VMs 'DC-01','DC-02' -Enforced
+
+# Rules for DR-CLUSTER — same rule name is allowed in a different cluster
+Add-HvDRSAffinityRule -ClusterName 'DR-CLUSTER' -Name 'DC Anti-Affinity' `
+                      -Type VmVmAntiAffinity -VMs 'DC-DR-01','DC-DR-02' -Enforced
+
+# Returns only PROD-CLUSTER rules
+Get-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER'
+
+# Returns only DR-CLUSTER rules
+Get-HvDRSAffinityRule -ClusterName 'DR-CLUSTER'
+
+# Returns all rules from all clusters
+Get-HvDRSAffinityRule
+
+# Remove only the PROD-CLUSTER copy — the DR-CLUSTER copy is untouched
+Remove-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'DC Anti-Affinity'
+```
+
+`Invoke-HvDRS` automatically filters to the target cluster's rules each pass — no additional configuration is needed.
+
+### How Rules Integrate with Invoke-HvDRS
 
 Each `Invoke-HvDRS` pass runs two migration planning passes:
 
@@ -460,11 +501,11 @@ Each `Invoke-HvDRS` pass runs two migration planning passes:
 
 Hard-rule checks block any happiness-based migration that would create a new violation, regardless of how much happiness improvement it would deliver.
 
-### Using a custom rule file
+### Using a Custom Rule File
 
 ```powershell
 # Manage rules in a project-specific file
-Add-HvDRSAffinityRule -Name 'App Affinity' -Type VmVmAffinity `
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'App Affinity' -Type VmVmAffinity `
                       -VMs 'APP-01','APP-02' -RulesPath D:\Config\my-rules.json
 
 # Run HvDRS against the same file
@@ -504,9 +545,13 @@ Check two things:
    Get-ClusterOwnerNode -Cluster 'PROD-CLUSTER' -Group 'Virtual Machine MyVM'
    ```
 
+### CSV IO happiness scores are all null
+
+Some Windows configurations don't expose CSV volumes as `\LogicalDisk\*` performance counter instances. If latency counters are unavailable, HVDRS automatically falls back to space-only scoring with a verbose warning. Run with `-Verbose` to see which CSVs failed counter collection. Alternatively, use `-SampleCount 0` to skip IO collection entirely and score on space only.
+
 ### Dynamic Memory pressure counter is unavailable
 
-If a VM's `\Hyper-V Dynamic Memory VM\Current Pressure` counter cannot be read (e.g., Dynamic Memory is not enabled, or the counter is momentarily unavailable), HVDRS assumes pressure = 100 (fully balanced). The VM will not be penalized for this — memory happiness falls back to the host memory utilization proxy.
+If a VM's `\Hyper-V Dynamic Memory VM\Current Pressure` counter cannot be read, HVDRS assumes pressure = 100 (fully balanced). The VM will not be penalized — memory happiness falls back to the host memory utilization proxy.
 
 ### Memory happiness seems low for VMs with static RAM
 
@@ -525,7 +570,15 @@ $logFile = Join-Path $logDir ("hvdrs_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
 
 Import-Module HVDRS
 
+# Compute DRS pass
 Invoke-HvDRS `
+    -ClusterName    'PROD-CLUSTER' `
+    -AggressionLevel 3 `
+    -Verbose `
+    *>> $logFile
+
+# Storage DRS pass
+Invoke-HvStorageDRS `
     -ClusterName    'PROD-CLUSTER' `
     -AggressionLevel 3 `
     -Verbose `

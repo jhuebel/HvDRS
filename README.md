@@ -17,9 +17,12 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 | **Cluster-aware migration** | Uses `Move-ClusterVirtualMachineRole` and respects possible-owner constraints |
 | **Aggression levels 1–5** | Controls happiness threshold and minimum improvement required to trigger a move |
 | **Greedy planning pass** | Simulated state is updated after each planned migration so subsequent decisions stay consistent |
+| **Affinity / Anti-Affinity rules** | Four rule types (VmVmAffinity, VmVmAntiAffinity, VmHostAffinity, VmHostAntiAffinity); hard (enforced) or soft; per-cluster scoping |
+| **Two-pass planner** | Compliance pass fixes hard-rule violations first; happiness pass scores remaining candidates with rule impact adjustments |
+| **Storage DRS** | CSV utilization-based storage rebalancing via `Move-VMStorage`; space + latency happiness scoring |
 | **Dry-run / WhatIf** | Standard PowerShell `-WhatIf` previews recommendations without migrating |
 | **Recommend-Only mode** | `-RecommendOnly` switch for monitoring-only scheduled passes |
-| **Maintenance mode** | Lock-file mechanism to temporarily freeze migrations during maintenance windows |
+| **Maintenance mode** | Lock-file mechanism to temporarily freeze both compute and storage migrations |
 
 ---
 
@@ -37,6 +40,9 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -WhatIf
 
 # Live run at default aggression (level 3)
 Invoke-HvDRS -ClusterName 'PROD-CLUSTER'
+
+# Storage rebalancing pass
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -WhatIf
 ```
 
 ---
@@ -45,21 +51,31 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER'
 
 ```
 HVDRS/
-├── HVDRS.psd1                          # Module manifest
-├── HVDRS.psm1                          # Module loader
+├── HVDRS.psd1                                    # Module manifest
+├── HVDRS.psm1                                    # Module loader
 └── Functions/
     ├── Private/
-    │   ├── Get-ClusterSnapshot.ps1     # Metric collection (CPU, memory, network)
-    │   ├── Measure-VmHappiness.ps1     # Happiness score calculation
-    │   └── Find-MigrationCandidates.ps1# Migration planning
+    │   ├── Get-ClusterSnapshot.ps1               # Metric collection (CPU, memory, network)
+    │   ├── Measure-VmHappiness.ps1               # VM happiness score calculation
+    │   ├── Find-MigrationCandidates.ps1          # Two-pass compute migration planner
+    │   ├── Get-AffinityRuleSet.ps1               # Load/save affinity rules from JSON
+    │   ├── Test-AffinityCompliance.ps1           # Current-placement violation detection
+    │   ├── Get-MigrationRuleImpact.ps1           # Per-migration rule impact evaluation
+    │   ├── Get-StorageSnapshot.ps1               # CSV metric collection (space, IOPS, latency)
+    │   ├── Measure-CsvHappiness.ps1              # CSV happiness score calculation
+    │   └── Find-StorageMigrationCandidates.ps1   # Greedy storage migration planner
     └── Public/
-        ├── Invoke-HvDRS.ps1            # Main entry point
-        └── Maintenance.ps1             # Enable/Disable/Get maintenance mode
+        ├── Invoke-HvDRS.ps1                      # Compute DRS entry point
+        ├── Invoke-HvStorageDRS.ps1               # Storage DRS entry point
+        ├── AffinityRules.ps1                     # Affinity rule CRUD + compliance check
+        └── Maintenance.ps1                       # Enable/Disable/Get maintenance mode
 ```
 
 ---
 
-## Happiness Score Algorithm
+## Happiness Score Algorithms
+
+### VM Happiness (compute)
 
 ```
 HappinessScore = (CpuHappiness × CpuWeight) + (MemoryHappiness × MemoryWeight)
@@ -67,25 +83,41 @@ HappinessScore = (CpuHappiness × CpuWeight) + (MemoryHappiness × MemoryWeight)
                                   CpuWeight + MemoryWeight
 ```
 
-**CPU Happiness**
-Host CPU stress ramps linearly from 0 at 70% utilization to 1.0 at 100%.
-A VM that is not demanding CPU remains happy even on a loaded host.
+**CPU Happiness** — host CPU stress ramps linearly from 0 at 70% utilization to 1.0 at 100%. A VM that is not demanding CPU remains happy even on a loaded host.
 
 ```
 stress        = max(0, (hostCpuUtil − 70) / 30)
 cpuHappiness  = max(0, 100 − stress × vmCpuUtil)
 ```
 
-**Memory Happiness — Dynamic Memory**
-Uses the `\Hyper-V Dynamic Memory VM\Current Pressure` performance counter.
-Pressure ≤ 100 means the VM has what it needs (or more); above 150 is fully unhappy.
+**Memory Happiness — Dynamic Memory** — uses `\Hyper-V Dynamic Memory VM\Current Pressure`. Pressure ≤ 100 means the VM has what it needs; above 150 is fully unhappy.
 
-**Memory Happiness — Static Memory**
-Proxied from host available memory utilization (fully happy ≤ 70%, fully unhappy ≥ 90%).
+**Memory Happiness — Static Memory** — proxied from host available memory utilization (fully happy ≤ 70%, fully unhappy ≥ 90%).
+
+### CSV Happiness (storage)
+
+**Space happiness** — based on free space percentage:
+
+| Free % | Score |
+|---|---|
+| ≥ 40% | 100 |
+| 20–40% | 50 + (pct – 20) × 2.5 |
+| 10–20% | (pct – 10) × 5 |
+| < 10% | 0 |
+
+**IO happiness** — based on average disk transfer latency. Falls back to space-only automatically when counters are unavailable.
+
+| Latency | Score |
+|---|---|
+| ≤ 5 ms | 100 |
+| 5–20 ms | 100 − (lat – 5) × 6.67 |
+| > 20 ms | 0 |
 
 ---
 
 ## Aggression Levels
+
+Same thresholds apply to both compute and storage DRS:
 
 | Level | Trigger below | Minimum improvement | Typical use |
 |-------|--------------|---------------------|-------------|
@@ -101,7 +133,13 @@ Proxied from host available memory utilization (fully happy ≤ 70%, fully unhap
 
 | Function | Purpose |
 |---|---|
-| `Invoke-HvDRS` | Run a DRS balancing pass |
+| `Invoke-HvDRS` | Run a compute DRS balancing pass |
+| `Invoke-HvStorageDRS` | Run a storage DRS balancing pass |
+| `Add-HvDRSAffinityRule` | Define a new affinity or anti-affinity rule |
+| `Get-HvDRSAffinityRule` | List rules with optional filtering |
+| `Remove-HvDRSAffinityRule` | Delete a rule by name or ID |
+| `Set-HvDRSAffinityRule` | Modify an existing rule |
+| `Test-HvDRSAffinityCompliance` | Check current cluster placement against all rules |
 | `Enable-HvDRSMaintenance` | Create maintenance lock file (freeze migrations) |
 | `Disable-HvDRSMaintenance` | Remove lock file (resume migrations) |
 | `Get-HvDRSMaintenanceStatus` | Check whether maintenance mode is active |
@@ -122,6 +160,6 @@ See [TESTS.md](TESTS.md) for the test suite layout, coverage details, and how to
 
 ---
 
-## Planned Extensions
+## License
 
-- **Storage DRS** — CSV utilization-based VM disk placement (separate module)
+MIT License — see [LICENSE](LICENSE).

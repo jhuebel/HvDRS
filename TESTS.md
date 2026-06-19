@@ -48,8 +48,8 @@ Invoke-Pester ./Tests/ -Output Normal
 
 ```powershell
 $cfg = New-PesterConfiguration
-$cfg.Run.Path         = './Tests/'
-$cfg.Output.Verbosity = 'Detailed'
+$cfg.Run.Path              = './Tests/'
+$cfg.Output.Verbosity      = 'Detailed'
 $cfg.TestResult.Enabled    = $true
 $cfg.TestResult.OutputPath = './TestResults.xml'
 $cfg.TestResult.OutputFormat = 'NUnitXml'
@@ -64,24 +64,27 @@ Invoke-Pester -Configuration $cfg
 Tests/
 ├── Helpers/
 │   └── New-TestObjects.ps1                   # Shared builder functions for test data
-├── Measure-VmHappiness.Tests.ps1             # Unit tests for the happiness scoring algorithm
-├── Find-MigrationCandidates.Tests.ps1        # Unit tests for the migration planning logic
-├── Get-MigrationRuleImpact.Tests.ps1         # Unit tests for per-migration rule impact evaluation
-├── Test-AffinityCompliance.Tests.ps1         # Unit tests for current-placement violation detection
-├── AffinityRules.Tests.ps1                   # Unit tests for CRUD operations on the rule store
-├── Measure-CsvHappiness.Tests.ps1            # Unit tests for CSV happiness scoring
-└── Find-StorageMigrationCandidates.Tests.ps1 # Unit tests for storage migration planning
+├── Measure-VmHappiness.Tests.ps1             # VM happiness scoring algorithm
+├── Find-MigrationCandidates.Tests.ps1        # Compute migration planning logic
+├── Get-MigrationRuleImpact.Tests.ps1         # Per-migration rule impact evaluation
+├── Test-AffinityCompliance.Tests.ps1         # Current-placement violation detection
+├── AffinityRules.Tests.ps1                   # Affinity rule CRUD + per-cluster scoping
+├── Measure-CsvHappiness.Tests.ps1            # CSV happiness scoring algorithm
+└── Find-StorageMigrationCandidates.Tests.ps1 # Storage migration planning logic
 ```
 
 ### `Tests/Helpers/New-TestObjects.ps1`
 
-Dot-sourced by both test files inside their `BeforeAll` blocks. Provides three builder functions with sensible defaults so each test only specifies the values relevant to that case:
+Dot-sourced by test files inside their `BeforeAll` blocks. Provides builder functions with sensible defaults so each test only specifies the values relevant to that case:
 
 | Function | Returns | Key parameters |
 |---|---|---|
 | `New-HostMetrics` | Host node PSCustomObject | `-Name`, `-CpuUtil`, `-TotalMemMB`, `-AvailMemMB`, `-LPs`, `-NetUtil` |
 | `New-VmMetrics` | VM PSCustomObject | `-Name`, `-HostNode`, `-CpuUtil`, `-Procs`, `-MemAssignMB`, `-DynMem`, `-Pressure` |
 | `New-Snapshot` | Cluster snapshot PSCustomObject | `-ClusterName`, `-Nodes`, `-VMs` |
+| `New-CsvMetrics` | CSV PSCustomObject | `-Name`, `-Path`, `-OwnerNode`, `-TotalGB`, `-FreeGB`; optional `-LatencyMs`, `-ReadIOPS`, `-WriteIOPS` |
+| `New-VmStorageMetrics` | VM storage PSCustomObject | `-Name`, `-HostNode`, `-PrimaryCSV`, `-TotalVhdGB`; generates VHDs array automatically |
+| `New-StorageSnapshot` | Storage snapshot PSCustomObject | `-ClusterName`, `-CSVs`, `-VMs` |
 
 ---
 
@@ -150,7 +153,7 @@ Verifies property names (`VMName`, `HostNode`, `CpuHappiness`, `MemHappiness`, `
 
 ### `Find-MigrationCandidates.Tests.ps1` — 18 tests
 
-Tests the migration planning logic in `Functions/Private/Find-MigrationCandidates.ps1`. All calls to `Get-ClusterOwnerNode` are mocked; the FailoverClusters module is not required.
+Tests the two-pass migration planning logic in `Functions/Private/Find-MigrationCandidates.ps1`. All calls to `Get-ClusterOwnerNode` are mocked; the FailoverClusters module is not required.
 
 **Basic Triggering** (2 tests)
 
@@ -276,42 +279,46 @@ Tests current-placement violation detection in `Functions/Private/Test-AffinityC
 
 ---
 
-### `AffinityRules.Tests.ps1` — 26 tests
+### `AffinityRules.Tests.ps1` — 36 tests
 
-Tests the public CRUD functions in `Functions/Public/AffinityRules.ps1` using a per-test temporary JSON file so the real rule store at `$env:ProgramData\HvDRS\rules.json` is never touched.
+Tests the public CRUD functions in `Functions/Public/AffinityRules.ps1` and the private `Get-AffinityRuleSet` filter. Uses a per-test temporary JSON file so the real rule store at `$env:ProgramData\HvDRS\rules.json` is never touched.
 
-**Add-HvDRSAffinityRule** (8 tests)
+**Add-HvDRSAffinityRule** (11 tests)
 
 | Scenario | Verified |
 |---|---|
 | Create a VmVmAffinity rule | Rule persisted, Name and Type correct |
+| Rule stores ClusterName | `ClusterName` property matches `-ClusterName` argument |
 | New rule gets a unique GUID | `RuleId` parseable as `[System.Guid]` |
 | Default `Enforced` is `$false` | Confirmed without `-Enforced` switch |
 | `-Enforced` switch sets `$true` | Confirmed |
 | VmVmAffinity with fewer than 2 VMs | Throws |
 | VmHostAffinity with no `-Hosts` | Throws |
-| Duplicate name | Warning emitted, second rule not stored |
-| Multiple rules stored correctly | Count = 2 |
+| Duplicate name in same cluster | Warning emitted, second rule not stored |
+| Same name allowed in different cluster | Both rules stored; total count = 2 |
+| Multiple rules in same cluster | Count = 2 |
 | `-WhatIf` | No file created |
 
-**Get-HvDRSAffinityRule** (7 tests)
+**Get-HvDRSAffinityRule** (8 tests)
 
-- Returns all rules (no filter).
-- Filters by exact `Name`.
+- Returns all rules across all clusters when `-ClusterName` is omitted.
+- Returns only the specified cluster's rules when `-ClusterName` is provided.
+- Filters by exact `Name` (ByName parameter set).
 - Supports wildcards in `Name`.
 - Filters by `Type`.
 - Filters by `VmName`.
 - Filters by `RuleId`.
 - Returns empty array when no rules match.
 
-**Remove-HvDRSAffinityRule** (4 tests)
+**Remove-HvDRSAffinityRule** (5 tests)
 
 - Removes by `Name`; remaining rules intact.
 - Removes by `RuleId`.
+- Removes only from the specified cluster when `-ClusterName` is given; sibling cluster rule untouched.
 - Non-existent name → warning, no error, count unchanged.
 - `-WhatIf` → no removal.
 
-**Set-HvDRSAffinityRule** (7 tests)
+**Set-HvDRSAffinityRule** (9 tests)
 
 - `-NewName` renames the rule.
 - `-Description` replaces description text.
@@ -321,6 +328,13 @@ Tests the public CRUD functions in `Functions/Public/AffinityRules.ps1` using a 
 - Removing members below minimum count → throws.
 - Unknown `RuleId` → warning, no change.
 - `-WhatIf` → no change persisted.
+- `ClusterName` is preserved on the rule after editing.
+
+**Per-cluster scoping** (3 tests)
+
+- Rules for different clusters coexist in the same file without interference; `Get-HvDRSAffinityRule -ClusterName` returns only that cluster's subset.
+- Removing a rule from one cluster does not affect another cluster's rule with the same name.
+- Private `Get-AffinityRuleSet -ClusterName` returns only the matching cluster's rules.
 
 ---
 
@@ -334,10 +348,10 @@ Tests the CSV happiness scoring formula in `Functions/Private/Measure-CsvHappine
 |---|---|---|
 | ≥ 40% (e.g. 60%) | 100 | 100.0 |
 | Exactly 40% | 100 | 100.0 |
-| 30% (midpoint 20–40%) | 50 + (30-20)*2.5 | 75.0 |
+| 30% (midpoint 20–40%) | 50 + (30-20)×2.5 | 75.0 |
 | Exactly 20% | 50 + 0 | 50.0 |
-| 15% (midpoint 10–20%) | (15-10)*5 | 25.0 |
-| Exactly 10% | (10-10)*5 | 0.0 |
+| 15% (midpoint 10–20%) | (15-10)×5 | 25.0 |
+| Exactly 10% | (10-10)×5 | 0.0 |
 | < 10% (e.g. 5%) | clamped | 0.0 |
 
 **IO Happiness — latency** (6 tests)
@@ -390,8 +404,8 @@ Tests the storage migration planning logic in `Functions/Private/Find-StorageMig
 
 **Aggression levels** (3 tests)
 
-- CSV at score 62.5 not triggered at level 3 (threshold=50).
-- Same CSV triggered at level 5 (threshold=70).
+- CSV at score 62.5 not triggered at level 3 (threshold=50; 62.5 > 50).
+- Same CSV triggered at level 5 (threshold=70; 62.5 < 70).
 - Trivially small VHD produces too little improvement to meet level-1 minimum (+40 pts).
 
 **Destination selection** (1 test)
