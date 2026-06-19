@@ -6,8 +6,15 @@ function Add-HvDRSAffinityRule {
     .SYNOPSIS
         Defines a new affinity or anti-affinity rule for HvDRS to enforce during migration planning.
 
+    .PARAMETER ClusterName
+        Name of the Failover Cluster this rule applies to. Rules are stored in a shared
+        JSON file and filtered by cluster at load time, so the same file can hold rules
+        for multiple clusters without interference.
+        Defaults to the local cluster if omitted.
+
     .PARAMETER Name
-        Human-readable name for the rule. Must be unique within the rule store.
+        Human-readable name for the rule. Must be unique within a cluster (the same
+        name may be reused across different clusters).
 
     .PARAMETER Type
         VmVmAffinity        — Keep the listed VMs on the same host.
@@ -37,15 +44,17 @@ function Add-HvDRSAffinityRule {
         Path to the JSON rule store. Defaults to $env:ProgramData\HvDRS\rules.json.
 
     .EXAMPLE
-        Add-HvDRSAffinityRule -Name 'DC Anti-Affinity' -Type VmVmAntiAffinity `
-                              -VMs 'DC-01','DC-02' -Enforced
+        Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'DC Anti-Affinity' `
+                              -Type VmVmAntiAffinity -VMs 'DC-01','DC-02' -Enforced
 
     .EXAMPLE
-        Add-HvDRSAffinityRule -Name 'SQL Licensing' -Type VmHostAffinity `
-                              -VMs 'SQL-PROD-01' -Hosts 'HV-NODE1','HV-NODE2' -Enforced
+        Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'SQL Licensing' `
+                              -Type VmHostAffinity -VMs 'SQL-PROD-01' `
+                              -Hosts 'HV-NODE1','HV-NODE2' -Enforced
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
+        [string]   $ClusterName = '',
         [Parameter(Mandatory)] [string]   $Name,
         [Parameter(Mandatory)]
         [ValidateSet('VmVmAffinity','VmVmAntiAffinity','VmHostAffinity','VmHostAntiAffinity')]
@@ -57,6 +66,11 @@ function Add-HvDRSAffinityRule {
         [string]   $RulesPath   = $script:HvDRSDefaultRulesPath
     )
 
+    if (-not $ClusterName) {
+        try { $ClusterName = (Get-Cluster -ErrorAction Stop).Name }
+        catch { throw "No -ClusterName specified and no local cluster detected. $_" }
+    }
+
     # Validate minimum membership
     if ($Type -in @('VmVmAffinity','VmVmAntiAffinity') -and $VMs.Count -lt 2) {
         throw "$Type rules require at least two VM names."
@@ -65,18 +79,21 @@ function Add-HvDRSAffinityRule {
         throw "$Type rules require at least one host name via -Hosts."
     }
 
-    if (-not $PSCmdlet.ShouldProcess($Name, "Add HvDRS $Type rule")) { return }
+    if (-not $PSCmdlet.ShouldProcess($Name, "Add HvDRS $Type rule for cluster '$ClusterName'")) { return }
 
+    # Load ALL rules (unfiltered) so we can save the full set back
     $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath)
 
-    if ($rules | Where-Object { $_.Name -eq $Name }) {
-        Write-Warning "A rule named '$Name' already exists. Use Set-HvDRSAffinityRule to modify it."
+    # Duplicate check is scoped to the same cluster
+    if ($rules | Where-Object { $_.ClusterName -eq $ClusterName -and $_.Name -eq $Name }) {
+        Write-Warning "A rule named '$Name' already exists for cluster '$ClusterName'. Use Set-HvDRSAffinityRule to modify it."
         return
     }
 
     $rule = [PSCustomObject]@{
         RuleId      = [System.Guid]::NewGuid().ToString()
         Name        = $Name
+        ClusterName = $ClusterName
         Type        = $Type
         Enforced    = [bool]$Enforced
         VMs         = @($VMs)
@@ -88,7 +105,7 @@ function Add-HvDRSAffinityRule {
     $rules.Add($rule)
     Save-AffinityRuleSet -Rules $rules.ToArray() -Path $RulesPath
 
-    Write-Host "Rule '$Name' added (ID: $($rule.RuleId))."
+    Write-Host "Rule '$Name' added for cluster '$ClusterName' (ID: $($rule.RuleId))."
     return $rule
 }
 
@@ -96,6 +113,10 @@ function Get-HvDRSAffinityRule {
     <#
     .SYNOPSIS
         Lists HvDRS affinity and anti-affinity rules, with optional filtering.
+
+    .PARAMETER ClusterName
+        When specified, returns only rules belonging to this cluster.
+        Omit to return rules for all clusters (useful for auditing the shared file).
 
     .PARAMETER RuleId
         Return the rule with this specific ID.
@@ -114,6 +135,7 @@ function Get-HvDRSAffinityRule {
     #>
     [CmdletBinding(DefaultParameterSetName = 'All')]
     param(
+        [string] $ClusterName = '',
         [Parameter(ParameterSetName = 'ById',   Mandatory)] [string] $RuleId,
         [Parameter(ParameterSetName = 'ByName')]             [string] $Name,
         [Parameter(ParameterSetName = 'ByType')]
@@ -123,7 +145,7 @@ function Get-HvDRSAffinityRule {
         [string] $RulesPath = $script:HvDRSDefaultRulesPath
     )
 
-    $rules = Get-AffinityRuleSet -Path $RulesPath
+    $rules = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
 
     switch ($PSCmdlet.ParameterSetName) {
         'ById'   { return @($rules | Where-Object { $_.RuleId -eq $RuleId }) }
@@ -143,15 +165,20 @@ function Remove-HvDRSAffinityRule {
     param(
         [Parameter(ParameterSetName = 'ById',   Mandatory)] [string] $RuleId,
         [Parameter(ParameterSetName = 'ByName', Mandatory)] [string] $Name,
-        [string] $RulesPath = $script:HvDRSDefaultRulesPath
+        [string] $ClusterName = '',
+        [string] $RulesPath   = $script:HvDRSDefaultRulesPath
     )
 
+    # Load ALL rules unfiltered — we need the full set to save back correctly
     $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath)
 
     $target = if ($PSCmdlet.ParameterSetName -eq 'ById') {
         $rules | Where-Object { $_.RuleId -eq $RuleId }
     } else {
-        $rules | Where-Object { $_.Name -eq $Name }
+        # Scope name lookup to the cluster when provided; avoids cross-cluster collisions
+        $rules | Where-Object {
+            $_.Name -eq $Name -and (-not $ClusterName -or $_.ClusterName -eq $ClusterName)
+        }
     }
 
     if (-not $target) {
@@ -275,9 +302,9 @@ function Test-HvDRSAffinityCompliance {
         catch { throw "No -ClusterName specified and no local cluster detected. $_" }
     }
 
-    $ruleSet = Get-AffinityRuleSet -Path $RulesPath
+    $ruleSet = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
     if (-not $ruleSet -or $ruleSet.Count -eq 0) {
-        Write-Host "No affinity rules are defined. Add rules with Add-HvDRSAffinityRule."
+        Write-Host "No affinity rules are defined for cluster '$ClusterName'. Add rules with Add-HvDRSAffinityRule -ClusterName '$ClusterName'."
         return @()
     }
 
@@ -287,7 +314,7 @@ function Test-HvDRSAffinityCompliance {
     $violations = Test-AffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet
 
     if (-not $violations -or $violations.Count -eq 0) {
-        Write-Host "All $($ruleSet.Count) affinity rule(s) are satisfied."
+        Write-Host "All $($ruleSet.Count) affinity rule(s) for cluster '$ClusterName' are satisfied."
         return @()
     }
 

@@ -163,7 +163,7 @@ function Invoke-HvDRS {
     }
 
     # ── Load affinity rules ────────────────────────────────────────────────────
-    $ruleSet   = Get-AffinityRuleSet -Path $RulesPath
+    $ruleSet   = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
     $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
 
     Write-Host ("{0} HvDRS starting — Cluster: {1}  Aggression: {2}  Network gate: {3}%  Rules: {4}  Mode: {5}" -f

@@ -1,14 +1,19 @@
 function Get-AffinityRuleSet {
     [CmdletBinding()]
     param(
-        [string]$Path = (Join-Path $env:ProgramData 'HvDRS\rules.json')
+        [string]$ClusterName = '',
+        [string]$Path        = (Join-Path $env:ProgramData 'HvDRS\rules.json')
     )
 
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
 
     try {
-        $data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-        return @($data.Rules)
+        $data  = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        $rules = @($data.Rules)
+        if ($ClusterName) {
+            $rules = @($rules | Where-Object { $_.ClusterName -eq $ClusterName })
+        }
+        return $rules
     } catch {
         Write-Warning "Could not load affinity rules from '$Path': $_"
         return @()
