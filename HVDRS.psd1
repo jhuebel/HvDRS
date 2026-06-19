@@ -6,7 +6,8 @@
     Copyright         = '(c) 2026 Jason Huebel. Licensed under the MIT License.'
     Description       = 'Hyper-V Distributed Resource Scheduler — VM Happiness-based compute and storage load balancing for Failover Clusters, with affinity/anti-affinity rule enforcement'
     PowerShellVersion = '5.1'
-    RequiredModules   = @('FailoverClusters', 'Hyper-V')
+    # FailoverClusters and Hyper-V are Windows Server role modules that cannot be
+    # installed from the gallery — declared as ExternalModuleDependencies instead.
     FunctionsToExport = @(
         'Invoke-HvDRS',
         'Enable-HvDRSMaintenance',
@@ -26,6 +27,7 @@
                 'VirtualMachine', 'VM', 'LiveMigration', 'StorageMigration',
                 'CSV', 'ClusterSharedVolume', 'Affinity', 'WindowsServer', 'Automation'
             )
+            ExternalModuleDependencies = @('FailoverClusters', 'Hyper-V')
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
