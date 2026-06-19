@@ -29,8 +29,8 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 ## Quick Start
 
 ```powershell
-# Install the module (see INSTALL.md for full options)
-Copy-Item -Recurse .\HVDRS "C:\Program Files\WindowsPowerShell\Modules\"
+# Install from PowerShell Gallery (see INSTALL.md for all options)
+Install-Module -Name HVDRS -Scope CurrentUser
 
 # Import
 Import-Module HVDRS

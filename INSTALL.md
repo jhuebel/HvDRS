@@ -38,9 +38,33 @@ The account used to run HVDRS (interactively or as a scheduled task) requires:
 
 ## Installation
 
-### Option 1 — Copy to the PowerShell module path (recommended)
+### Option 1 — PowerShell Gallery (recommended)
 
-Copy the `HVDRS` folder to a directory in `$env:PSModulePath`. The standard system-wide location is:
+Install directly from [PowerShell Gallery](https://www.powershellgallery.com/packages/HVDRS):
+
+```powershell
+# System-wide (requires an elevated prompt)
+Install-Module -Name HVDRS -Scope AllUsers
+
+# Current user only (no elevation required)
+Install-Module -Name HVDRS -Scope CurrentUser
+```
+
+The module is automatically placed in the correct `$env:PSModulePath` location and can be imported immediately:
+
+```powershell
+Import-Module HVDRS
+```
+
+To update to a newer version later:
+
+```powershell
+Update-Module -Name HVDRS
+```
+
+### Option 2 — Copy from source
+
+Clone the repository and copy the module folder to a directory in `$env:PSModulePath`. The standard system-wide location is:
 
 ```powershell
 Copy-Item -Recurse .\HVDRS "C:\Program Files\WindowsPowerShell\Modules\HVDRS"
@@ -58,7 +82,7 @@ Verify the module is discoverable:
 Get-Module -ListAvailable HVDRS
 ```
 
-### Option 2 — Import directly from source
+### Option 3 — Import directly from source
 
 If you prefer to keep the module in a custom location, import it by path:
 
