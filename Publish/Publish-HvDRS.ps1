@@ -75,8 +75,23 @@ Write-Ok "Config loaded — repository: $repository"
 # ── Step 2: Validate manifest ─────────────────────────────────────────────────
 Write-Step 'Validating module manifest...'
 
-$manifest = Test-ModuleManifest -Path $manifestPath -ErrorAction Stop
-Write-Ok "Manifest valid — $moduleName $($manifest.Version)"
+# Test-ModuleManifest resolves RequiredModules on the local machine, which fails
+# on non-Windows hosts (or any machine without FailoverClusters/Hyper-V installed).
+# Fall back to Import-PowerShellDataFile for version extraction in that case.
+$manifest = $null
+try {
+    $manifest = Test-ModuleManifest -Path $manifestPath -ErrorAction Stop
+    Write-Ok "Manifest valid — $moduleName $($manifest.Version)"
+} catch {
+    if ($_ -match 'RequiredModules' -or $_ -match 'invalid') {
+        $psd1Data = Import-PowerShellDataFile -Path $manifestPath
+        $manifest  = [PSCustomObject]@{ Version = [version]$psd1Data.ModuleVersion }
+        Write-Warning "Test-ModuleManifest could not resolve RequiredModules on this host (Windows-only modules). Manifest syntax was read successfully."
+        Write-Ok "Manifest readable — $moduleName $($manifest.Version)"
+    } else {
+        throw
+    }
+}
 
 # ── Step 3: Run tests ─────────────────────────────────────────────────────────
 if (-not $SkipTests -and -not $WhatIfPreference) {
