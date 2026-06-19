@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '1.2.0'
+    ModuleVersion     = '1.2.1'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -31,6 +31,10 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.2.1
+- Documentation only: promoted PowerShell Gallery install to the recommended option in INSTALL.md
+- Updated README Quick Start to use Install-Module instead of Copy-Item
+
 ## 1.2.0
 - Added per-cluster scoping for affinity/anti-affinity rules
 - Rules stored in shared JSON file are now filtered by ClusterName at load time
