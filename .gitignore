@@ -7,3 +7,6 @@ Logs/
 
 # Maintenance lock (runtime state, not source)
 *.lock
+
+# Publish credentials — copy Publish/publish.config.template.json and fill in your API key
+Publish/publish.config.json

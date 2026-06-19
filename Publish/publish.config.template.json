@@ -1,0 +1,5 @@
+{
+    "_comment": "Copy this file to publish.config.json, fill in your settings, and keep it out of source control. publish.config.json is listed in .gitignore.",
+    "ApiKey":     "YOUR_POWERSHELL_GALLERY_API_KEY_HERE",
+    "Repository": "PSGallery"
+}
