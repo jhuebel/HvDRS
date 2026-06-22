@@ -1,5 +1,7 @@
 # HVDRS — Hyper-V Distributed Resource Scheduler
 
+[![PowerShell Gallery](https://img.shields.io/powershellgallery/v/HVDRS.svg)](https://www.powershellgallery.com/packages/HVDRS)
+
 A PowerShell module that brings VMware DRS-style **VM Happiness** load balancing to Windows Server Hyper-V Failover Clusters.
 
 Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores every running VM on a **0–100 happiness scale** based on whether it is receiving the CPU and memory resources it demands. Unhappy VMs are automatically live-migrated to better-suited nodes, subject to cluster ownership constraints and a **Network-Aware destination filter** that prevents saturating host NICs.
@@ -30,7 +32,8 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 ## Quick Start
 
 ```powershell
-# Install from PowerShell Gallery (see INSTALL.md for all options)
+# Install from PowerShell Gallery: https://www.powershellgallery.com/packages/HVDRS
+# (see INSTALL.md for all options)
 Install-Module -Name HVDRS -Scope CurrentUser
 
 # Import
