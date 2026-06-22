@@ -367,7 +367,7 @@ Describe 'Find-MigrationCandidates' {
 
             $result = Find-MigrationCandidates -Snapshot $script:baseSnapshot `
                                                -AggressionLevel 3 -ClusterName 'TEST'
-            $uniqueVms = $result | Select-Object -ExpandProperty VMName -Unique
+            $uniqueVms = @($result | Select-Object -ExpandProperty VMName -Unique)
             $uniqueVms.Count | Should -Be $result.Count
         }
     }

@@ -22,7 +22,7 @@ function Test-StorageAffinityCompliance {
         [PSCustomObject[]]                        $RuleSet
     )
 
-    if (-not $RuleSet -or $RuleSet.Count -eq 0) { return @() }
+    if (-not $RuleSet -or $RuleSet.Count -eq 0) { return ,@() }
 
     $pathToName = @{}
     foreach ($csv in $Snapshot.CSVs) { $pathToName[$csv.Path] = $csv.Name }

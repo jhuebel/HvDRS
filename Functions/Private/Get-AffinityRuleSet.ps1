@@ -6,8 +6,12 @@ function Get-AffinityRuleSet {
     )
 
     # PowerShell collapses a 0-element array to $null when it crosses the function
-    # output boundary via a bare `return @()`. The leading comma forces the array
-    # to survive so callers always receive a real (possibly empty) collection.
+    # output boundary. The leading comma forces an empty array to survive so direct
+    # casts/captures (e.g. [List[T]](Get-AffinityRuleSet ...)) get a real empty
+    # collection instead of $null. It is intentionally NOT applied when the array
+    # is non-empty — comma-protecting a populated array would make it cross the
+    # boundary as a single pipeline object, breaking `Get-AffinityRuleSet | Where-Object`
+    # style consumption elsewhere in this module.
     if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
 
     try {
@@ -16,7 +20,8 @@ function Get-AffinityRuleSet {
         if ($ClusterName) {
             $rules = @($rules | Where-Object { $_.ClusterName -eq $ClusterName })
         }
-        return ,$rules
+        if ($rules.Count -eq 0) { return ,@() }
+        return $rules
     } catch {
         Write-Warning "Could not load affinity rules from '$Path': $_"
         return ,@()

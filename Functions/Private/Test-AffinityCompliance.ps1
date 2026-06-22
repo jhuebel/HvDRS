@@ -14,7 +14,7 @@ function Test-AffinityCompliance {
         [PSCustomObject[]]                        $RuleSet
     )
 
-    if (-not $RuleSet -or $RuleSet.Count -eq 0) { return @() }
+    if (-not $RuleSet -or $RuleSet.Count -eq 0) { return ,@() }
 
     $vmHost = @{}
     foreach ($vm in $Snapshot.VMs) { $vmHost[$vm.VMName] = $vm.HostNode }

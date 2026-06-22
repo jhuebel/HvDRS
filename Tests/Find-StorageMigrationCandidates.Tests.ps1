@@ -155,7 +155,7 @@ Describe 'Find-StorageMigrationCandidates — greedy state update' {
         $snap   = New-ImbalancedSnapshot -VmVhdGB 100
         $result = Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 5
         $vmNames = @($result | Select-Object -ExpandProperty VMName)
-        ($vmNames | Select-Object -Unique).Count | Should -Be $vmNames.Count
+        @($vmNames | Select-Object -Unique).Count | Should -Be $vmNames.Count
     }
 
     It 'respects reduced headroom after first planned migration when scheduling second' {

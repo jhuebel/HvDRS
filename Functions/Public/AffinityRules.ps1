@@ -353,7 +353,7 @@ function Test-HvDRSAffinityCompliance {
     $ruleSet = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
     if (-not $ruleSet -or $ruleSet.Count -eq 0) {
         Write-Host "No affinity rules are defined for cluster '$ClusterName'. Add rules with Add-HvDRSAffinityRule -ClusterName '$ClusterName'."
-        return @()
+        return ,@()
     }
 
     Write-Host "Collecting cluster placement snapshot..."
@@ -363,7 +363,7 @@ function Test-HvDRSAffinityCompliance {
 
     if (-not $violations -or $violations.Count -eq 0) {
         Write-Host "All $($ruleSet.Count) affinity rule(s) for cluster '$ClusterName' are satisfied."
-        return @()
+        return ,@()
     }
 
     $hardCount = @($violations | Where-Object { $_.Enforced }).Count
@@ -415,7 +415,7 @@ function Test-HvDRSStorageAffinityCompliance {
 
     if ($ruleSet.Count -eq 0) {
         Write-Host "No storage affinity rules are defined for cluster '$ClusterName'. Add rules with Add-HvDRSAffinityRule -Type VmCsvAffinity|VmCsvAntiAffinity|VmVmCsvAffinity|VmVmCsvAntiAffinity."
-        return @()
+        return ,@()
     }
 
     Write-Host "Collecting storage placement snapshot..."
@@ -425,7 +425,7 @@ function Test-HvDRSStorageAffinityCompliance {
 
     if (-not $violations -or $violations.Count -eq 0) {
         Write-Host "All $($ruleSet.Count) storage affinity rule(s) for cluster '$ClusterName' are satisfied."
-        return @()
+        return ,@()
     }
 
     $hardCount = @($violations | Where-Object { $_.Enforced }).Count

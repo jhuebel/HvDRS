@@ -306,7 +306,7 @@ Describe 'Set-HvDRSAffinityRule' {
         Set-HvDRSAffinityRule -RuleId $script:ruleId -AddVMs @('VM2','VM3') -RulesPath $testRulesPath
         $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
         $rule.VMs | Should -Contain 'VM3'
-        ($rule.VMs | Where-Object { $_ -eq 'VM2' }).Count | Should -Be 1
+        @($rule.VMs | Where-Object { $_ -eq 'VM2' }).Count | Should -Be 1
     }
 
     It 'removes VMs via -RemoveVMs' {
@@ -354,7 +354,7 @@ Describe 'Set-HvDRSAffinityRule — storage CSV list' {
         Set-HvDRSAffinityRule -RuleId $script:csvRuleId -AddCSVs @('Volume1','Volume2') -RulesPath $testRulesPath
         $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
         $rule.CSVs | Should -Contain 'Volume2'
-        ($rule.CSVs | Where-Object { $_ -eq 'Volume1' }).Count | Should -Be 1
+        @($rule.CSVs | Where-Object { $_ -eq 'Volume1' }).Count | Should -Be 1
     }
 
     It 'removes CSVs via -RemoveCSVs' {

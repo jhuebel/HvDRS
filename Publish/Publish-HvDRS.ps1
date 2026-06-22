@@ -122,7 +122,7 @@ if (-not $SkipTests -and -not $WhatIfPreference) {
 Write-Step 'Staging module files...'
 
 # Directories and files at the repo root that must NOT be included in the published module
-$excludeDirs  = @('Publish', 'Tests', '.git')
+$excludeDirs  = @('Publish', 'Tests', '.git', '.claude')
 $excludeFiles = @('PUBLISH.md', '.gitignore', '.gitattributes')
 
 $stageRoot  = Join-Path ([System.IO.Path]::GetTempPath()) "HvDRS-publish-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
@@ -132,8 +132,12 @@ if ($PSCmdlet.ShouldProcess($stageModule, 'Create staging directory')) {
     New-Item -Path $stageModule -ItemType Directory -Force | Out-Null
 }
 
+# Excludes any dotfile/dotdir (.git, .claude, .vscode, etc.) in addition to the
+# explicit lists above, so local editor/tooling config never ships in the package.
 $items = Get-ChildItem -LiteralPath $repoRoot -Force |
-    Where-Object { $_.Name -notin $excludeDirs -and $_.Name -notin $excludeFiles -and $_.Name -ne '.git' }
+    Where-Object {
+        $_.Name -notin $excludeDirs -and $_.Name -notin $excludeFiles -and -not $_.Name.StartsWith('.')
+    }
 
 foreach ($item in $items) {
     if ($PSCmdlet.ShouldProcess($item.FullName, 'Stage for publishing')) {
