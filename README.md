@@ -26,6 +26,7 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 | **Dry-run / WhatIf** | Standard PowerShell `-WhatIf` previews recommendations without migrating |
 | **Recommend-Only mode** | `-RecommendOnly` switch for monitoring-only scheduled passes |
 | **Maintenance mode** | Lock-file mechanism to temporarily freeze both compute and storage migrations |
+| **Cluster discovery** | `Get-HvDRSCluster` lists nodes, VMs, and CSVs without collecting performance counters or proposing migrations |
 
 ---
 
@@ -59,6 +60,7 @@ HVDRS/
 ├── HVDRS.psm1                                    # Module loader
 └── Functions/
     ├── Private/
+    │   ├── Get-ClusterInventory.ps1              # Lightweight node/VM/CSV discovery (no metrics)
     │   ├── Get-ClusterSnapshot.ps1               # Metric collection (CPU, memory, network)
     │   ├── Measure-VmHappiness.ps1               # VM happiness score calculation
     │   ├── Find-MigrationCandidates.ps1          # Two-pass compute migration planner
@@ -71,6 +73,7 @@ HVDRS/
     │   ├── Test-StorageAffinityCompliance.ps1    # Current-placement storage violation detection
     │   └── Get-StorageMigrationRuleImpact.ps1    # Per-migration storage rule impact evaluation
     └── Public/
+        ├── Get-HvDRSCluster.ps1                  # Discover nodes, VMs, and CSVs (read-only)
         ├── Invoke-HvDRS.ps1                      # Compute DRS entry point
         ├── Invoke-HvStorageDRS.ps1               # Storage DRS entry point
         ├── AffinityRules.ps1                     # Affinity rule CRUD + compute/storage compliance checks
@@ -139,6 +142,7 @@ Same thresholds apply to both compute and storage DRS:
 
 | Function | Purpose |
 |---|---|
+| `Get-HvDRSCluster` | Discover nodes, VMs, and CSVs on a cluster — read-only, no performance counters collected |
 | `Invoke-HvDRS` | Run a compute DRS balancing pass |
 | `Invoke-HvStorageDRS` | Run a storage DRS balancing pass |
 | `Add-HvDRSAffinityRule` | Define a new affinity or anti-affinity rule |

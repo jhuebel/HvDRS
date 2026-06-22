@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.3.0'
+    ModuleVersion     = '1.4.0'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -11,6 +11,7 @@
     # installed from the gallery — declared as ExternalModuleDependencies instead.
     FunctionsToExport = @(
         'Invoke-HvDRS',
+        'Get-HvDRSCluster',
         'Enable-HvDRSMaintenance',
         'Disable-HvDRSMaintenance',
         'Get-HvDRSMaintenanceStatus',
@@ -33,6 +34,10 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.4.0
+- Added Get-HvDRSCluster: lightweight, read-only discovery of cluster nodes, VMs, and
+  Cluster Shared Volumes, with no performance-counter collection and no migrations proposed
+
 ## 1.3.0
 - CRITICAL FIX: the module manifest was missing RootModule, so Import-Module HVDRS
   never loaded HVDRS.psm1 and exported zero functions in every prior published
