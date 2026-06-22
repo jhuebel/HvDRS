@@ -76,13 +76,13 @@ Describe 'Measure-CsvHappiness — IO Happiness (latency)' {
         # 100 - (12.5-5) * (100/15) = 100 - 7.5*6.667 = 100 - 50 = 50
         $csv    = New-CsvMetrics -FreeGB 800 -LatencyMs 12.5
         $result = Measure-CsvHappiness -CsvMetrics $csv -SpaceWeight 0.0 -IoWeight 1.0
-        $result.IoHappiness | Should -BeApproximately 50.0 -Because 'midpoint of degradation band'
+        $result.IoHappiness | Should -Be 50.0 -Because 'midpoint of degradation band'
     }
 
     It 'returns 0 when latency is exactly 20 ms' {
         $csv    = New-CsvMetrics -FreeGB 800 -LatencyMs 20.0
         $result = Measure-CsvHappiness -CsvMetrics $csv -SpaceWeight 0.0 -IoWeight 1.0
-        $result.IoHappiness | Should -BeApproximately 0.0 0.1
+        $result.IoHappiness | Should -Be 0.0
     }
 
     It 'returns 0 when latency is above 20 ms' {
@@ -136,7 +136,7 @@ Describe 'Measure-CsvHappiness — combined score with weights' {
         # 5% free → SpaceHappy=0 but we want to test pure I/O weighting
         $csv    = New-CsvMetrics -TotalGB 1000 -FreeGB 800 -LatencyMs 12.5   # IoHappy≈50
         $result = Measure-CsvHappiness -CsvMetrics $csv -SpaceWeight 0.0 -IoWeight 1.0
-        $result.HappinessScore | Should -BeApproximately 50.0 0.5
+        $result.HappinessScore | Should -Be 50.0
     }
 
     It 'both components at 100 yield score of 100' {

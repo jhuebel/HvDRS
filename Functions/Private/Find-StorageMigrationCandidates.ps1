@@ -5,8 +5,15 @@ function Find-StorageMigrationCandidates {
         storage space and I/O load across the cluster.
 
     .DESCRIPTION
-        Algorithm:
+        Two-pass algorithm, mirroring Find-MigrationCandidates:
 
+        Pass 1 — Storage rule compliance (hard-rule violations in current placement)
+          For each enforced storage affinity rule that is currently violated, selects
+          the best (VM, destination CSV) pair that resolves the violation without
+          introducing any new hard storage-rule violation. These migrations are added
+          to the plan first, and the simulated CSV state is updated accordingly.
+
+        Pass 2 — Happiness (space/IO load balancing)
           1. Score every CSV with Measure-CsvHappiness.
           2. Identify CSVs whose current (simulated) score is below the
              aggression-level happiness threshold, sorted most→least unhappy.
@@ -14,9 +21,13 @@ function Find-StorageMigrationCandidates {
              (unscheduled VM on source, candidate destination CSV):
                • Candidate must have enough headroom after receiving the VM's
                  VHDs: (FreeGB – vm.TotalVhdGB) >= MinFreeGBReserve.
-               • Simulate source after VM departs → projectedSrcScore.
+               • Storage rule impact of the move is checked:
+                   - Hard violation → destination excluded.
+                   - Soft violation → configurable score penalty applied.
+                   - Fixes a violation → configurable score bonus applied.
+               • Simulate source after VM departs → projectedSrcScore (rule-adjusted).
                • Simulate destination after VM arrives → projectedDstScore.
-               • improvement = projectedSrcScore − currentSimSrcScore.
+               • improvement = adjustedSrcScore − currentSimSrcScore.
           4. Pick the (VM, destination) pair with the highest improvement.
           5. If improvement meets the aggression-level minimum, add to the plan.
           6. Update simulated CSV state (FreeGB) before moving to the next source.
@@ -24,12 +35,26 @@ function Find-StorageMigrationCandidates {
         The simulated state ensures the greedy planner does not over-commit a
         single destination CSV across multiple planned moves.
 
+    .PARAMETER RuleSet
+        Array of storage affinity / anti-affinity rule objects (VmVmCsvAffinity,
+        VmVmCsvAntiAffinity, VmCsvAffinity, VmCsvAntiAffinity) returned by
+        Get-AffinityRuleSet. Pass an empty array or omit to disable rule checking.
+
+    .PARAMETER SoftRuleViolationPenalty
+        Points subtracted from a candidate destination's projected source-relief score
+        when the move would break a soft (non-enforced) storage rule (default: 25).
+
+    .PARAMETER RuleComplianceBonus
+        Points added to a candidate's projected score when the move fixes an existing
+        soft storage-rule violation (default: 25). Hard-rule compliance migrations are
+        always recommended regardless of the happiness improvement.
+
     .OUTPUTS
         List of PSCustomObjects: VMName, VMId, HostNode, SourceCSV, SourceCSVName,
         DestinationCSV, DestinationCSVName, VHDCount, TotalVhdGB,
         SourceFreeGBBefore, SourceFreeGBAfter, DestFreeGBBefore, DestFreeGBAfter,
         SourceScoreBefore, SourceScoreAfter, DestScoreBefore, DestScoreAfter,
-        Improvement.
+        Improvement, ComplianceReason.
     #>
     [CmdletBinding()]
     param(
@@ -45,7 +70,11 @@ function Find-StorageMigrationCandidates {
         [ValidateRange(0.0, 1.0)]
         [float] $IoWeight          = 0.3,
 
-        [int]   $MinFreeGBReserve  = 50
+        [int]   $MinFreeGBReserve  = 50,
+
+        [PSCustomObject[]] $RuleSet                  = @(),
+        [float]            $SoftRuleViolationPenalty = 25.0,
+        [float]            $RuleComplianceBonus      = 25.0
     )
 
     $thresholds = @{
@@ -83,6 +112,10 @@ function Find-StorageMigrationCandidates {
     $pathToName = @{}
     foreach ($csv in $Snapshot.CSVs) { $pathToName[$csv.Path] = $csv.Name }
 
+    # VM → current CSV-name mapping (used for rule evaluation)
+    $vmCsvName = @{}
+    foreach ($vm in $Snapshot.VMs) { $vmCsvName[$vm.VMName] = $pathToName[$vm.PrimaryCSV] }
+
     # Helper: score a simulated CSV object
     $scoreSimCsv = {
         param($sim)
@@ -98,6 +131,95 @@ function Find-StorageMigrationCandidates {
     $scheduledVMs = [System.Collections.Generic.HashSet[string]]::new()
     $migrations   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+    # ════════════════════════════════════════════════════════════════════════════
+    # PASS 1 — Storage rule compliance (fix enforced-rule violations first)
+    # ════════════════════════════════════════════════════════════════════════════
+    if ($RuleSet -and $RuleSet.Count -gt 0) {
+        $hardViolations = @(Test-StorageAffinityCompliance -Snapshot $Snapshot -RuleSet $RuleSet |
+                            Where-Object { $_.Enforced })
+
+        foreach ($violation in $hardViolations) {
+            $movable = @($violation.VMs | Where-Object { -not $scheduledVMs.Contains($_) })
+            if ($movable.Count -eq 0) { continue }
+
+            $bestFix   = $null
+            $bestScore = -1
+
+            foreach ($vmName in $movable) {
+                $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
+                if (-not $vm) { continue }
+
+                $srcName = $vmCsvName[$vmName]
+                $simSrcForVm = $simCsvs[$srcName]
+                if (-not $simSrcForVm) { continue }
+
+                $candidates = $simCsvs.Values | Where-Object {
+                    $_.Name -ne $srcName -and
+                    ($_.FreeGB - $vm.TotalVhdGB) -ge $MinFreeGBReserve
+                }
+
+                foreach ($dst in $candidates) {
+                    $impact = Get-StorageMigrationRuleImpact -VMName $vmName -DestinationCsvName $dst.Name `
+                                                              -Snapshot $Snapshot -RuleSet $RuleSet
+
+                    if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
+
+                    $dstFreeAfter = $dst.FreeGB - $vm.TotalVhdGB
+                    $dstSimCopy   = [PSCustomObject]@{
+                        Name = $dst.Name; TotalGB = $dst.TotalGB
+                        FreeGB = $dstFreeAfter; LatencyMs = $dst.LatencyMs
+                    }
+                    $projectedDstScore = & $scoreSimCsv $dstSimCopy
+
+                    if ($projectedDstScore -gt $bestScore) {
+                        $bestScore = $projectedDstScore
+
+                        $srcFreeAfter = $simSrcForVm.FreeGB + $vm.TotalVhdGB
+                        $srcSimCopy   = [PSCustomObject]@{
+                            Name = $simSrcForVm.Name; TotalGB = $simSrcForVm.TotalGB
+                            FreeGB = $srcFreeAfter; LatencyMs = $simSrcForVm.LatencyMs
+                        }
+                        $projectedSrcScore = & $scoreSimCsv $srcSimCopy
+
+                        $bestFix = [PSCustomObject]@{
+                            VMName             = $vmName
+                            VMId               = $vm.VMId
+                            HostNode           = $vm.HostNode
+                            SourceCSV          = $simSrcForVm.Path
+                            SourceCSVName      = $simSrcForVm.Name
+                            DestinationCSV     = $dst.Path
+                            DestinationCSVName = $dst.Name
+                            VHDCount           = $vm.VHDs.Count
+                            TotalVhdGB         = $vm.TotalVhdGB
+                            SourceFreeGBBefore = [Math]::Round($simSrcForVm.FreeGB, 1)
+                            SourceFreeGBAfter  = [Math]::Round($srcFreeAfter, 1)
+                            DestFreeGBBefore   = [Math]::Round($dst.FreeGB, 1)
+                            DestFreeGBAfter    = [Math]::Round($dstFreeAfter, 1)
+                            SourceScoreBefore  = $initialScores[$srcName]
+                            SourceScoreAfter   = [Math]::Round($projectedSrcScore, 1)
+                            DestScoreBefore    = $initialScores[$dst.Name]
+                            DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
+                            Improvement        = [Math]::Round($projectedSrcScore - $initialScores[$srcName], 1)
+                            ComplianceReason   = $violation.Description
+                        }
+                    }
+                }
+            }
+
+            if ($bestFix) {
+                $migrations.Add($bestFix)
+                [void]$scheduledVMs.Add($bestFix.VMName)
+                $simCsvs[$bestFix.SourceCSVName].FreeGB      += $bestFix.TotalVhdGB
+                $simCsvs[$bestFix.DestinationCSVName].FreeGB -= $bestFix.TotalVhdGB
+            } else {
+                Write-Verbose "  No valid CSV destination found to resolve: $($violation.Description)"
+            }
+        }
+    }
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # PASS 2 — Happiness-based migrations (space / IO load balancing)
+    # ════════════════════════════════════════════════════════════════════════════
     # Collect unhappy CSVs — re-evaluated each outer iteration via simulated state
     $unhappyCsvNames = $initialScores.GetEnumerator() |
                        Where-Object { $_.Value -lt $happinessThreshold } |
@@ -130,6 +252,16 @@ function Find-StorageMigrationCandidates {
             }
 
             foreach ($dst in $candidates) {
+                # Storage rule impact check
+                $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
+                    Get-StorageMigrationRuleImpact -VMName $vm.VMName -DestinationCsvName $dst.Name `
+                                                   -Snapshot $Snapshot -RuleSet $RuleSet
+                } else {
+                    [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
+                }
+
+                if ($impact.HasHardViolation) { continue }
+
                 # Simulate source after VM departs
                 $srcFreeAfter = $simSrc.FreeGB + $vm.TotalVhdGB
                 $srcSimCopy   = [PSCustomObject]@{
@@ -146,7 +278,12 @@ function Find-StorageMigrationCandidates {
                 }
                 $projectedDstScore = (Measure-CsvHappiness -CsvMetrics $dstSimCopy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
 
-                $improvement = $projectedSrcScore - $currentSrcScore
+                # Apply rule-aware adjustment to the source-relief score used for selection
+                $adjustedSrcScore = $projectedSrcScore
+                if ($impact.HasSoftViolation) { $adjustedSrcScore = [Math]::Max(0,   $adjustedSrcScore - $SoftRuleViolationPenalty) }
+                if ($impact.FixesViolation)   { $adjustedSrcScore = [Math]::Min(100, $adjustedSrcScore + $RuleComplianceBonus) }
+
+                $improvement = $adjustedSrcScore - $currentSrcScore
 
                 if ($improvement -gt $bestImprovement) {
                     $bestImprovement = $improvement
@@ -169,6 +306,7 @@ function Find-StorageMigrationCandidates {
                         DestScoreBefore    = $initialScores[$dst.Name]
                         DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
                         Improvement        = [Math]::Round($improvement, 1)
+                        ComplianceReason   = $null
                     }
                 }
             }

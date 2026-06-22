@@ -47,6 +47,21 @@ function Invoke-HvStorageDRS {
         Minimum free space (GB) that must remain on the destination CSV after the
         VM's VHDs land (default: 50 GB).
 
+    .PARAMETER RulesPath
+        Path to the JSON affinity rule store. Only storage rule types (VmVmCsvAffinity,
+        VmVmCsvAntiAffinity, VmCsvAffinity, VmCsvAntiAffinity) are applied; compute-only
+        rule types are ignored. If the file does not exist, rule checking is skipped.
+        Default: $env:ProgramData\HvDRS\rules.json.
+        Manage rules with Add-HvDRSAffinityRule / Get-HvDRSAffinityRule / etc.
+
+    .PARAMETER SoftRuleViolationPenalty
+        Score penalty (0–100) applied to a candidate destination's projected score when
+        a proposed storage migration would break a soft storage affinity rule (default: 25).
+
+    .PARAMETER RuleComplianceBonus
+        Score bonus (0–100) added to a candidate's projected score when a storage
+        migration would fix an existing soft rule violation (default: 25).
+
     .PARAMETER RecommendOnly
         Print the migration plan but never call Move-VMStorage.
 
@@ -85,9 +100,17 @@ function Invoke-HvStorageDRS {
 
         [int]   $MinFreeGBReserve      = 50,
 
+        [string] $RulesPath = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json'),
+
+        [ValidateRange(0.0, 100.0)]
+        [float] $SoftRuleViolationPenalty = 25.0,
+
+        [ValidateRange(0.0, 100.0)]
+        [float] $RuleComplianceBonus      = 25.0,
+
         [switch] $RecommendOnly,
 
-        [string] $MaintenanceLockFile  = (Join-Path $env:ProgramData 'HvDRS\maintenance.lock')
+        [string] $MaintenanceLockFile  = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
     )
 
     # ── Resolve cluster ────────────────────────────────────────────────────────
@@ -107,8 +130,14 @@ function Invoke-HvStorageDRS {
         "MAINTENANCE ($lockContent)"
     } elseif ($RecommendOnly) { 'RECOMMEND-ONLY' } else { 'AUTO-MIGRATE' }
 
-    Write-Host ("{0} HvStorageDRS starting — Cluster: {1}  Aggression: {2}  Weights: Space={3} IO={4}  Reserve: {5} GB  Mode: {6}" -f
-        (& $ts), $ClusterName, $AggressionLevel, $SpaceWeight, $IoWeight, $MinFreeGBReserve, $modeLabel)
+    # ── Load storage affinity rules ────────────────────────────────────────────
+    $storageRuleTypes = @('VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity')
+    $ruleSet   = @(Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName |
+                  Where-Object { $_.Type -in $storageRuleTypes })
+    $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
+
+    Write-Host ("{0} HvStorageDRS starting — Cluster: {1}  Aggression: {2}  Weights: Space={3} IO={4}  Reserve: {5} GB  Rules: {6}  Mode: {7}" -f
+        (& $ts), $ClusterName, $AggressionLevel, $SpaceWeight, $IoWeight, $MinFreeGBReserve, $ruleLabel, $modeLabel)
 
     if ($maintenanceActive) {
         $lockContent = Get-Content -LiteralPath $MaintenanceLockFile -ErrorAction SilentlyContinue
@@ -132,6 +161,28 @@ function Invoke-HvStorageDRS {
 
     Write-Host ("{0} Snapshot: {1} CSV(s), {2} VM(s) with CSV storage." -f
         (& $ts), $snapshot.CSVs.Count, $snapshot.VMs.Count)
+
+    # ── Phase 1.5: Check storage affinity rule compliance ─────────────────────
+    if ($ruleSet.Count -gt 0) {
+        $storageViolations = @(Test-StorageAffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet)
+
+        if ($storageViolations.Count -gt 0) {
+            $hardCount = @($storageViolations | Where-Object { $_.Enforced }).Count
+            $softCount = $storageViolations.Count - $hardCount
+
+            Write-Host ('── {0} Storage Rule Violation(s) Detected — {1} hard, {2} soft ───────────────' -f
+                $storageViolations.Count, $hardCount, $softCount)
+
+            $storageViolations | Format-Table -AutoSize -Wrap -Property `
+                @{ N='Rule';     E={ $_.RuleName } },
+                @{ N='Type';     E={ $_.Type } },
+                @{ N='Hard';     E={ $_.Enforced } },
+                @{ N='VMs';      E={ $_.VMs -join ', ' } },
+                @{ N='Detail';   E={ $_.Description } }
+        } else {
+            Write-Host ("{0} All {1} storage affinity rule(s) satisfied." -f (& $ts), $ruleSet.Count)
+        }
+    }
 
     # ── Phase 2: CSV space + I/O summary ──────────────────────────────────────
     Write-Host ''
@@ -171,6 +222,9 @@ function Invoke-HvStorageDRS {
                       -SpaceWeight $SpaceWeight `
                       -IoWeight $IoWeight `
                       -MinFreeGBReserve $MinFreeGBReserve `
+                      -RuleSet $ruleSet `
+                      -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
+                      -RuleComplianceBonus $RuleComplianceBonus `
                       -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
     if (-not $migrations -or $migrations.Count -eq 0) {
@@ -190,7 +244,12 @@ function Invoke-HvStorageDRS {
         @{ N='Src Score';    E={ '{0} → {1}' -f $_.SourceScoreBefore, $_.SourceScoreAfter } },
         @{ N='Dst Score';    E={ '{0} → {1}' -f $_.DestScoreBefore,   $_.DestScoreAfter } },
         @{ N='Src Free GB';  E={ '{0:N0} → {1:N0}' -f $_.SourceFreeGBBefore, $_.SourceFreeGBAfter } },
-        @{ N='Delta';        E={ '+{0}' -f $_.Improvement } }
+        @{ N='Delta';        E={ '+{0}' -f $_.Improvement } },
+        @{ N='Trigger';      E={
+            if ($_.ComplianceReason) {
+                'Compliance: ' + ($_.ComplianceReason.Substring(0, [Math]::Min(40, $_.ComplianceReason.Length)))
+            } else { 'Happiness' }
+        }}
 
     # ── Phase 5: Execute or preview ────────────────────────────────────────────
     if (-not $willMigrate) {

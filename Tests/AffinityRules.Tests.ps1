@@ -11,7 +11,12 @@
     No FailoverClusters or Hyper-V modules are required.
 #>
 
+# Pester 5 does not allow BeforeEach/AfterEach directly at the root of a block
+# container, so the whole file lives inside one outer Describe.
+Describe 'AffinityRules' {
+
 BeforeAll {
+    . "$PSScriptRoot/../Functions/Private/Get-HvDRSDataRoot.ps1"
     . "$PSScriptRoot/../Functions/Private/Get-AffinityRuleSet.ps1"
     . "$PSScriptRoot/../Functions/Public/AffinityRules.ps1"
 }
@@ -117,6 +122,44 @@ Describe 'Add-HvDRSAffinityRule' {
     }
 }
 
+Describe 'Add-HvDRSAffinityRule — storage rule types' {
+
+    It 'creates a VmVmCsvAffinity rule and persists it' {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'CsvAff' -Type 'VmVmCsvAffinity' `
+                              -VMs @('VM1','VM2') -RulesPath $testRulesPath
+        $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
+        $rule.Type | Should -Be 'VmVmCsvAffinity'
+    }
+
+    It 'creates a VmCsvAffinity rule with -CSVs and persists it' {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'TierOne' -Type 'VmCsvAffinity' `
+                              -VMs @('VM1') -CSVs @('Volume1','Volume2') -RulesPath $testRulesPath
+        $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
+        $rule.Type    | Should -Be 'VmCsvAffinity'
+        $rule.CSVs    | Should -Contain 'Volume1'
+        $rule.CSVs    | Should -Contain 'Volume2'
+    }
+
+    It 'throws when VmVmCsvAffinity has fewer than 2 VMs' {
+        { Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'Bad' -Type 'VmVmCsvAffinity' `
+                                -VMs @('VM1') -RulesPath $testRulesPath } |
+            Should -Throw
+    }
+
+    It 'throws when VmCsvAntiAffinity has no -CSVs' {
+        { Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'Bad' -Type 'VmCsvAntiAffinity' `
+                                -VMs @('VM1') -RulesPath $testRulesPath } |
+            Should -Throw
+    }
+
+    It 'defaults CSVs to an empty array for non-storage rule types' {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'HostRule' -Type 'VmHostAffinity' `
+                              -VMs @('VM1') -Hosts @('NODE1') -RulesPath $testRulesPath
+        $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
+        @($rule.CSVs).Count | Should -Be 0
+    }
+}
+
 Describe 'Get-HvDRSAffinityRule' {
 
     BeforeEach {
@@ -150,8 +193,10 @@ Describe 'Get-HvDRSAffinityRule' {
     }
 
     It 'supports wildcards in Name' {
+        # -Name filters on the rule's Name field, not its Type — only 'AppAffinity' matches
         $rules = Get-HvDRSAffinityRule -Name '*Affinity*' -RulesPath $testRulesPath
-        $rules.Count | Should -Be 2   # AppAffinity + SQL-Host (VmHostAffinity type, not in name)
+        $rules.Count   | Should -Be 1
+        $rules[0].Name | Should -Be 'AppAffinity'
     }
 
     It 'filters by Type' {
@@ -232,8 +277,9 @@ Describe 'Remove-HvDRSAffinityRule' {
 Describe 'Set-HvDRSAffinityRule' {
 
     BeforeEach {
+        # 3 VMs so removing one still satisfies the VmVmAffinity 2-VM minimum
         Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'EditMe' -Type 'VmVmAffinity' `
-                              -VMs @('VM1','VM2') -Description 'Original' `
+                              -VMs @('VM1','VM2','VM3') -Description 'Original' `
                               -RulesPath $testRulesPath
         $script:ruleId = (Get-HvDRSAffinityRule -Name 'EditMe' -RulesPath $testRulesPath).RuleId
     }
@@ -296,6 +342,35 @@ Describe 'Set-HvDRSAffinityRule' {
     }
 }
 
+Describe 'Set-HvDRSAffinityRule — storage CSV list' {
+
+    BeforeEach {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'CsvRule' -Type 'VmCsvAffinity' `
+                              -VMs @('VM1') -CSVs @('Volume1') -RulesPath $testRulesPath
+        $script:csvRuleId = (Get-HvDRSAffinityRule -Name 'CsvRule' -RulesPath $testRulesPath).RuleId
+    }
+
+    It 'adds CSVs via -AddCSVs without duplicating existing members' {
+        Set-HvDRSAffinityRule -RuleId $script:csvRuleId -AddCSVs @('Volume1','Volume2') -RulesPath $testRulesPath
+        $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
+        $rule.CSVs | Should -Contain 'Volume2'
+        ($rule.CSVs | Where-Object { $_ -eq 'Volume1' }).Count | Should -Be 1
+    }
+
+    It 'removes CSVs via -RemoveCSVs' {
+        Set-HvDRSAffinityRule -RuleId $script:csvRuleId -AddCSVs @('Volume2') -RulesPath $testRulesPath
+        Set-HvDRSAffinityRule -RuleId $script:csvRuleId -RemoveCSVs @('Volume1') -RulesPath $testRulesPath
+        $rule = Get-HvDRSAffinityRule -RulesPath $testRulesPath
+        $rule.CSVs | Should -Not -Contain 'Volume1'
+        $rule.CSVs | Should -Contain 'Volume2'
+    }
+
+    It 'throws when RemoveCSVs would leave zero CSVs for a VmCsv rule' {
+        { Set-HvDRSAffinityRule -RuleId $script:csvRuleId -RemoveCSVs @('Volume1') `
+              -RulesPath $testRulesPath } | Should -Throw
+    }
+}
+
 Describe 'Per-cluster scoping' {
 
     It 'rules for different clusters coexist in the same file without interference' {
@@ -339,4 +414,6 @@ Describe 'Per-cluster scoping' {
         $prodRules.Count             | Should -Be 1
         $prodRules[0].ClusterName    | Should -Be 'PROD'
     }
+}
+
 }

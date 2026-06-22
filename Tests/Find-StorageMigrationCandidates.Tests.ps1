@@ -7,6 +7,8 @@
 BeforeAll {
     . "$PSScriptRoot/Helpers/New-TestObjects.ps1"
     . "$PSScriptRoot/../Functions/Private/Measure-CsvHappiness.ps1"
+    . "$PSScriptRoot/../Functions/Private/Test-StorageAffinityCompliance.ps1"
+    . "$PSScriptRoot/../Functions/Private/Get-StorageMigrationRuleImpact.ps1"
     . "$PSScriptRoot/../Functions/Private/Find-StorageMigrationCandidates.ps1"
 
     # Two CSVs: Vol1 critically full (5% free), Vol2 spacious (75% free)
@@ -217,5 +219,68 @@ Describe 'Find-StorageMigrationCandidates — output object fields' {
 
     It 'SourceScoreAfter is greater than SourceScoreBefore' {
         $script:result.SourceScoreAfter | Should -BeGreaterThan $script:result.SourceScoreBefore
+    }
+
+    It 'includes ComplianceReason ($null for a happiness-driven move)' {
+        $script:result.PSObject.Properties.Name | Should -Contain 'ComplianceReason'
+        $script:result.ComplianceReason | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Find-StorageMigrationCandidates — storage rule compliance pass' {
+
+    It 'fixes a hard VmCsvAntiAffinity violation even when CSVs are otherwise happy' {
+        # All CSVs are happy (no space pressure) but VM1's storage sits on an excluded CSV
+        $csv1 = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 800
+        $csv2 = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 1000 -FreeGB 800
+        $vm   = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $snap = New-StorageSnapshot -CSVs @($csv1, $csv2) -VMs @($vm)
+
+        $rule = [PSCustomObject]@{
+            RuleId='r1'; Name='NoVol1'; Type='VmCsvAntiAffinity'; Enforced=$true
+            VMs=@('VM1'); CSVs=@('Volume1')
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -RuleSet @($rule))
+        $result.Count                | Should -Be 1
+        $result[0].VMName            | Should -Be 'VM1'
+        $result[0].DestinationCSVName | Should -Be 'Volume2'
+        $result[0].ComplianceReason  | Should -Not -BeNullOrEmpty
+    }
+
+    It 'does not move a VM that already satisfies its hard storage rule' {
+        $csv1 = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 800
+        $csv2 = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 1000 -FreeGB 800
+        $vm   = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $snap = New-StorageSnapshot -CSVs @($csv1, $csv2) -VMs @($vm)
+
+        $rule = [PSCustomObject]@{
+            RuleId='r1'; Name='Vol1Only'; Type='VmCsvAffinity'; Enforced=$true
+            VMs=@('VM1'); CSVs=@('Volume1')
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -RuleSet @($rule))
+        $result.Count | Should -Be 0
+    }
+
+    It 'excludes a destination that would break a hard VmVmCsvAntiAffinity rule during happiness rebalancing' {
+        # Volume1 unhappy (5% free) → VM1 should move. Volume2 (roomy) already hosts VM2,
+        # and a hard anti-affinity rule forbids VM1 and VM2 sharing a CSV. Volume3 is also roomy.
+        $src  = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 50
+        $dstA = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 2000 -FreeGB 1800
+        $dstB = New-CsvMetrics -Name 'Volume3' -Path 'C:\ClusterStorage\Volume3' -TotalGB 2000 -FreeGB 1800
+        $vm1  = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 100
+        $vm2  = New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume2' -TotalVhdGB 100
+        $snap = New-StorageSnapshot -CSVs @($src, $dstA, $dstB) -VMs @($vm1, $vm2)
+
+        $rule = [PSCustomObject]@{
+            RuleId='r1'; Name='SplitVMs'; Type='VmVmCsvAntiAffinity'; Enforced=$true
+            VMs=@('VM1','VM2'); CSVs=@()
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 5 -RuleSet @($rule))
+        $result.Count                 | Should -Be 1
+        $result[0].VMName             | Should -Be 'VM1'
+        $result[0].DestinationCSVName | Should -Be 'Volume3'
     }
 }

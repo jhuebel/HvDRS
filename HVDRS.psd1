@@ -1,5 +1,6 @@
 @{
-    ModuleVersion     = '1.2.1'
+    RootModule        = 'HVDRS.psm1'
+    ModuleVersion     = '1.3.0'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -18,6 +19,7 @@
         'Remove-HvDRSAffinityRule',
         'Set-HvDRSAffinityRule',
         'Test-HvDRSAffinityCompliance',
+        'Test-HvDRSStorageAffinityCompliance',
         'Invoke-HvStorageDRS'
     )
     PrivateData       = @{
@@ -31,6 +33,19 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.3.0
+- CRITICAL FIX: the module manifest was missing RootModule, so Import-Module HVDRS
+  never loaded HVDRS.psm1 and exported zero functions in every prior published
+  version. RootModule = 'HVDRS.psm1' is now set and the module works correctly.
+- Fixed Get-AffinityRuleSet returning $null instead of an empty array on a fresh
+  rules store, which broke adding the very first affinity rule
+- Added storage-specific affinity/anti-affinity rules: VmVmCsvAffinity, VmVmCsvAntiAffinity,
+  VmCsvAffinity, VmCsvAntiAffinity
+- Add-HvDRSAffinityRule / Set-HvDRSAffinityRule accept -CSVs (and -AddCSVs/-RemoveCSVs)
+- Invoke-HvStorageDRS now loads storage rules, runs a compliance pass ahead of the
+  happiness pass, and applies soft-rule penalties / compliance bonuses to candidate scoring
+- Added Test-HvDRSStorageAffinityCompliance for live VM-to-CSV placement auditing
+
 ## 1.2.1
 - Documentation only: promoted PowerShell Gallery install to the recommended option in INSTALL.md
 - Updated README Quick Start to use Install-Module instead of Copy-Item

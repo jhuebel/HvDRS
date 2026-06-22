@@ -17,9 +17,10 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 | **Cluster-aware migration** | Uses `Move-ClusterVirtualMachineRole` and respects possible-owner constraints |
 | **Aggression levels 1–5** | Controls happiness threshold and minimum improvement required to trigger a move |
 | **Greedy planning pass** | Simulated state is updated after each planned migration so subsequent decisions stay consistent |
-| **Affinity / Anti-Affinity rules** | Four rule types (VmVmAffinity, VmVmAntiAffinity, VmHostAffinity, VmHostAntiAffinity); hard (enforced) or soft; per-cluster scoping |
-| **Two-pass planner** | Compliance pass fixes hard-rule violations first; happiness pass scores remaining candidates with rule impact adjustments |
-| **Storage DRS** | CSV utilization-based storage rebalancing via `Move-VMStorage`; space + latency happiness scoring |
+| **Affinity / Anti-Affinity rules** | Four compute rule types (VmVmAffinity, VmVmAntiAffinity, VmHostAffinity, VmHostAntiAffinity); hard (enforced) or soft; per-cluster scoping |
+| **Storage Affinity / Anti-Affinity rules** | Four storage rule types (VmVmCsvAffinity, VmVmCsvAntiAffinity, VmCsvAffinity, VmCsvAntiAffinity) — keep/separate VMs' storage by CSV, same hard/soft model |
+| **Two-pass planner** | Compliance pass fixes hard-rule violations first; happiness pass scores remaining candidates with rule impact adjustments — applies to both compute and storage DRS |
+| **Storage DRS** | CSV utilization-based storage rebalancing via `Move-VMStorage`; space + latency happiness scoring; storage affinity rule enforcement |
 | **Dry-run / WhatIf** | Standard PowerShell `-WhatIf` previews recommendations without migrating |
 | **Recommend-Only mode** | `-RecommendOnly` switch for monitoring-only scheduled passes |
 | **Maintenance mode** | Lock-file mechanism to temporarily freeze both compute and storage migrations |
@@ -63,11 +64,13 @@ HVDRS/
     │   ├── Get-MigrationRuleImpact.ps1           # Per-migration rule impact evaluation
     │   ├── Get-StorageSnapshot.ps1               # CSV metric collection (space, IOPS, latency)
     │   ├── Measure-CsvHappiness.ps1              # CSV happiness score calculation
-    │   └── Find-StorageMigrationCandidates.ps1   # Greedy storage migration planner
+    │   ├── Find-StorageMigrationCandidates.ps1   # Two-pass storage migration planner
+    │   ├── Test-StorageAffinityCompliance.ps1    # Current-placement storage violation detection
+    │   └── Get-StorageMigrationRuleImpact.ps1    # Per-migration storage rule impact evaluation
     └── Public/
         ├── Invoke-HvDRS.ps1                      # Compute DRS entry point
         ├── Invoke-HvStorageDRS.ps1               # Storage DRS entry point
-        ├── AffinityRules.ps1                     # Affinity rule CRUD + compliance check
+        ├── AffinityRules.ps1                     # Affinity rule CRUD + compute/storage compliance checks
         └── Maintenance.ps1                       # Enable/Disable/Get maintenance mode
 ```
 
@@ -139,7 +142,8 @@ Same thresholds apply to both compute and storage DRS:
 | `Get-HvDRSAffinityRule` | List rules with optional filtering |
 | `Remove-HvDRSAffinityRule` | Delete a rule by name or ID |
 | `Set-HvDRSAffinityRule` | Modify an existing rule |
-| `Test-HvDRSAffinityCompliance` | Check current cluster placement against all rules |
+| `Test-HvDRSAffinityCompliance` | Check current cluster placement against all compute rules |
+| `Test-HvDRSStorageAffinityCompliance` | Check current VM-to-CSV storage placement against all storage rules |
 | `Enable-HvDRSMaintenance` | Create maintenance lock file (freeze migrations) |
 | `Disable-HvDRSMaintenance` | Remove lock file (resume migrations) |
 | `Get-HvDRSMaintenanceStatus` | Check whether maintenance mode is active |

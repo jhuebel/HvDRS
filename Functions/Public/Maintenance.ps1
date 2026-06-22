@@ -23,7 +23,7 @@ function Enable-HvDRSMaintenance {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [string]$Reason = 'Maintenance window',
-        [string]$LockFile = (Join-Path $env:ProgramData 'HvDRS\maintenance.lock')
+        [string]$LockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
     )
 
     if (-not $PSCmdlet.ShouldProcess($LockFile, 'Create maintenance lock file')) { return }
@@ -56,7 +56,7 @@ function Disable-HvDRSMaintenance {
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
-        [string]$LockFile = (Join-Path $env:ProgramData 'HvDRS\maintenance.lock')
+        [string]$LockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
     )
 
     if (-not (Test-Path -LiteralPath $LockFile)) {
@@ -81,7 +81,7 @@ function Get-HvDRSMaintenanceStatus {
     #>
     [CmdletBinding()]
     param(
-        [string]$LockFile = (Join-Path $env:ProgramData 'HvDRS\maintenance.lock')
+        [string]$LockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
     )
 
     if (Test-Path -LiteralPath $LockFile) {

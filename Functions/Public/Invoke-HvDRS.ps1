@@ -125,7 +125,7 @@ function Invoke-HvDRS {
 
         [int]$DestinationMemoryReserveMB = 512,
 
-        [string]$RulesPath = (Join-Path $env:ProgramData 'HvDRS\rules.json'),
+        [string]$RulesPath = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json'),
 
         [ValidateRange(0.0, 100.0)]
         [float]$SoftRuleViolationPenalty = 25.0,
@@ -135,7 +135,7 @@ function Invoke-HvDRS {
 
         [switch]$RecommendOnly,
 
-        [string]$MaintenanceLockFile = (Join-Path $env:ProgramData 'HvDRS\maintenance.lock')
+        [string]$MaintenanceLockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
     )
 
     # ── Resolve cluster ────────────────────────────────────────────────────────

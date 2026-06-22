@@ -1,5 +1,8 @@
-$script:HvDRSValidRuleTypes  = @('VmVmAffinity', 'VmVmAntiAffinity', 'VmHostAffinity', 'VmHostAntiAffinity')
-$script:HvDRSDefaultRulesPath = Join-Path $env:ProgramData 'HvDRS\rules.json'
+$script:HvDRSValidRuleTypes  = @(
+    'VmVmAffinity', 'VmVmAntiAffinity', 'VmHostAffinity', 'VmHostAntiAffinity',
+    'VmVmCsvAffinity', 'VmVmCsvAntiAffinity', 'VmCsvAffinity', 'VmCsvAntiAffinity'
+)
+$script:HvDRSDefaultRulesPath = Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json'
 
 function Add-HvDRSAffinityRule {
     <#
@@ -21,15 +24,23 @@ function Add-HvDRSAffinityRule {
         VmVmAntiAffinity    — Keep the listed VMs on different hosts.
         VmHostAffinity      — Run the listed VMs only on the specified hosts.
         VmHostAntiAffinity  — Never run the listed VMs on the specified hosts.
+        VmVmCsvAffinity     — Keep the listed VMs' storage on the same CSV.
+        VmVmCsvAntiAffinity — Keep the listed VMs' storage on different CSVs.
+        VmCsvAffinity       — Keep the listed VMs' storage only on the specified CSVs.
+        VmCsvAntiAffinity   — Never place the listed VMs' storage on the specified CSVs.
 
     .PARAMETER VMs
         VM names covered by this rule.
-        VmVmAffinity / VmVmAntiAffinity require at least two VM names.
-        VmHostAffinity / VmHostAntiAffinity require at least one VM name.
+        VmVmAffinity / VmVmAntiAffinity / VmVmCsvAffinity / VmVmCsvAntiAffinity require at least two VM names.
+        VmHostAffinity / VmHostAntiAffinity / VmCsvAffinity / VmCsvAntiAffinity require at least one VM name.
 
     .PARAMETER Hosts
         Required for VmHostAffinity and VmHostAntiAffinity.
         Node names of the hosts involved in the rule.
+
+    .PARAMETER CSVs
+        Required for VmCsvAffinity and VmCsvAntiAffinity.
+        Cluster Shared Volume names involved in the rule (see Get-StorageSnapshot / Get-ClusterSharedVolume).
 
     .PARAMETER Enforced
         Hard rule: HvDRS will never execute a migration that would break this rule, and will
@@ -51,16 +62,29 @@ function Add-HvDRSAffinityRule {
         Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'SQL Licensing' `
                               -Type VmHostAffinity -VMs 'SQL-PROD-01' `
                               -Hosts 'HV-NODE1','HV-NODE2' -Enforced
+
+    .EXAMPLE
+        Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'SQL Data/Log Split' `
+                              -Type VmVmCsvAntiAffinity -VMs 'SQL-PROD-01','SQL-PROD-02' -Enforced
+
+    .EXAMPLE
+        Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'Tier1 Storage Only' `
+                              -Type VmCsvAffinity -VMs 'SQL-PROD-01' `
+                              -CSVs 'Volume1','Volume2' -Enforced
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [string]   $ClusterName = '',
         [Parameter(Mandatory)] [string]   $Name,
         [Parameter(Mandatory)]
-        [ValidateSet('VmVmAffinity','VmVmAntiAffinity','VmHostAffinity','VmHostAntiAffinity')]
+        [ValidateSet(
+            'VmVmAffinity','VmVmAntiAffinity','VmHostAffinity','VmHostAntiAffinity',
+            'VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity'
+        )]
         [string]   $Type,
         [Parameter(Mandatory)] [string[]] $VMs,
         [string[]] $Hosts       = @(),
+        [string[]] $CSVs        = @(),
         [switch]   $Enforced,
         [string]   $Description = '',
         [string]   $RulesPath   = $script:HvDRSDefaultRulesPath
@@ -72,11 +96,14 @@ function Add-HvDRSAffinityRule {
     }
 
     # Validate minimum membership
-    if ($Type -in @('VmVmAffinity','VmVmAntiAffinity') -and $VMs.Count -lt 2) {
+    if ($Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and $VMs.Count -lt 2) {
         throw "$Type rules require at least two VM names."
     }
     if ($Type -in @('VmHostAffinity','VmHostAntiAffinity') -and $Hosts.Count -eq 0) {
         throw "$Type rules require at least one host name via -Hosts."
+    }
+    if ($Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and $CSVs.Count -eq 0) {
+        throw "$Type rules require at least one CSV name via -CSVs."
     }
 
     if (-not $PSCmdlet.ShouldProcess($Name, "Add HvDRS $Type rule for cluster '$ClusterName'")) { return }
@@ -98,6 +125,7 @@ function Add-HvDRSAffinityRule {
         Enforced    = [bool]$Enforced
         VMs         = @($VMs)
         Hosts       = @($Hosts)
+        CSVs        = @($CSVs)
         Description = $Description
         CreatedAt   = (Get-Date -Format 'o')
     }
@@ -139,7 +167,10 @@ function Get-HvDRSAffinityRule {
         [Parameter(ParameterSetName = 'ById',   Mandatory)] [string] $RuleId,
         [Parameter(ParameterSetName = 'ByName')]             [string] $Name,
         [Parameter(ParameterSetName = 'ByType')]
-        [ValidateSet('VmVmAffinity','VmVmAntiAffinity','VmHostAffinity','VmHostAntiAffinity')]
+        [ValidateSet(
+            'VmVmAffinity','VmVmAntiAffinity','VmHostAffinity','VmHostAntiAffinity',
+            'VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity'
+        )]
         [string] $Type,
         [Parameter(ParameterSetName = 'ByVm')]  [string] $VmName,
         [string] $RulesPath = $script:HvDRSDefaultRulesPath
@@ -223,6 +254,12 @@ function Set-HvDRSAffinityRule {
     .PARAMETER RemoveHosts
         Remove host names from the rule's host list.
 
+    .PARAMETER AddCSVs
+        Add CSV names to the rule's CSV list (VmCsvAffinity / VmCsvAntiAffinity only).
+
+    .PARAMETER RemoveCSVs
+        Remove CSV names from the rule's CSV list.
+
     .PARAMETER Description
         Replace the rule's description text.
     #>
@@ -235,6 +272,8 @@ function Set-HvDRSAffinityRule {
         [string[]] $RemoveVMs   = @(),
         [string[]] $AddHosts    = @(),
         [string[]] $RemoveHosts = @(),
+        [string[]] $AddCSVs     = @(),
+        [string[]] $RemoveCSVs  = @(),
         [string]   $Description,
         [string]   $RulesPath   = $script:HvDRSDefaultRulesPath
     )
@@ -265,10 +304,19 @@ function Set-HvDRSAffinityRule {
     if ($RemoveHosts.Count -gt 0) {
         $rule.Hosts = @($rule.Hosts | Where-Object { $RemoveHosts -notcontains $_ })
     }
+    if ($AddCSVs.Count -gt 0) {
+        $rule.CSVs = @(@($rule.CSVs) + $AddCSVs | Select-Object -Unique)
+    }
+    if ($RemoveCSVs.Count -gt 0) {
+        $rule.CSVs = @(@($rule.CSVs) | Where-Object { $RemoveCSVs -notcontains $_ })
+    }
 
     # Re-validate minimum membership after edits
-    if ($rule.Type -in @('VmVmAffinity','VmVmAntiAffinity') -and $rule.VMs.Count -lt 2) {
+    if ($rule.Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and $rule.VMs.Count -lt 2) {
         throw "Rule '$($rule.Name)' would have fewer than 2 VMs — $($rule.Type) requires at least 2."
+    }
+    if ($rule.Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and @($rule.CSVs).Count -eq 0) {
+        throw "Rule '$($rule.Name)' would have no CSVs — $($rule.Type) requires at least 1."
     }
 
     Save-AffinityRuleSet -Rules $rules.ToArray() -Path $RulesPath
@@ -323,6 +371,68 @@ function Test-HvDRSAffinityCompliance {
 
     Write-Host ''
     Write-Host ("── {0} Rule Violation(s) — {1} hard, {2} soft ─────────────────────────────────────" -f
+        $violations.Count, $hardCount, $softCount)
+
+    $violations | Format-Table -AutoSize -Wrap -Property `
+        @{ N='Rule';     E={ $_.RuleName } },
+        @{ N='Type';     E={ $_.Type } },
+        @{ N='Enforced'; E={ $_.Enforced } },
+        @{ N='VMs';      E={ $_.VMs -join ', ' } },
+        @{ N='Detail';   E={ $_.Description } }
+
+    return $violations
+}
+
+function Test-HvDRSStorageAffinityCompliance {
+    <#
+    .SYNOPSIS
+        Collects a live storage snapshot and checks current VM-to-CSV placement against
+        all configured storage affinity rules (VmVmCsvAffinity, VmVmCsvAntiAffinity,
+        VmCsvAffinity, VmCsvAntiAffinity), reporting any current violations.
+
+    .PARAMETER ClusterName
+        Target Failover Cluster. Defaults to the local cluster.
+
+    .PARAMETER RulesPath
+        Path to the JSON rule store.
+
+    .EXAMPLE
+        Test-HvDRSStorageAffinityCompliance -ClusterName 'PROD-CLUSTER'
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ClusterName,
+        [string] $RulesPath = $script:HvDRSDefaultRulesPath
+    )
+
+    if (-not $ClusterName) {
+        try { $ClusterName = (Get-Cluster -ErrorAction Stop).Name }
+        catch { throw "No -ClusterName specified and no local cluster detected. $_" }
+    }
+
+    $ruleSet = @(Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName |
+                Where-Object { $_.Type -in @('VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity') })
+
+    if ($ruleSet.Count -eq 0) {
+        Write-Host "No storage affinity rules are defined for cluster '$ClusterName'. Add rules with Add-HvDRSAffinityRule -Type VmCsvAffinity|VmCsvAntiAffinity|VmVmCsvAffinity|VmVmCsvAntiAffinity."
+        return @()
+    }
+
+    Write-Host "Collecting storage placement snapshot..."
+    $snapshot = Get-StorageSnapshot -ClusterName $ClusterName -SampleCount 0
+
+    $violations = Test-StorageAffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet
+
+    if (-not $violations -or $violations.Count -eq 0) {
+        Write-Host "All $($ruleSet.Count) storage affinity rule(s) for cluster '$ClusterName' are satisfied."
+        return @()
+    }
+
+    $hardCount = @($violations | Where-Object { $_.Enforced }).Count
+    $softCount = $violations.Count - $hardCount
+
+    Write-Host ''
+    Write-Host ("── {0} Storage Rule Violation(s) — {1} hard, {2} soft ─────────────────────────" -f
         $violations.Count, $hardCount, $softCount)
 
     $violations | Format-Table -AutoSize -Wrap -Property `

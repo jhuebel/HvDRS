@@ -2,10 +2,13 @@ function Get-AffinityRuleSet {
     [CmdletBinding()]
     param(
         [string]$ClusterName = '',
-        [string]$Path        = (Join-Path $env:ProgramData 'HvDRS\rules.json')
+        [string]$Path        = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json')
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    # PowerShell collapses a 0-element array to $null when it crosses the function
+    # output boundary via a bare `return @()`. The leading comma forces the array
+    # to survive so callers always receive a real (possibly empty) collection.
+    if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
 
     try {
         $data  = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
@@ -13,10 +16,10 @@ function Get-AffinityRuleSet {
         if ($ClusterName) {
             $rules = @($rules | Where-Object { $_.ClusterName -eq $ClusterName })
         }
-        return $rules
+        return ,$rules
     } catch {
         Write-Warning "Could not load affinity rules from '$Path': $_"
-        return @()
+        return ,@()
     }
 }
 
@@ -24,7 +27,7 @@ function Save-AffinityRuleSet {
     [CmdletBinding()]
     param(
         [PSCustomObject[]]$Rules,
-        [string]$Path = (Join-Path $env:ProgramData 'HvDRS\rules.json')
+        [string]$Path = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json')
     )
 
     $dir = Split-Path -LiteralPath $Path
