@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HVDRS PRO Tips Management Pack (unsealed fragment)
+
+  Surfaces HVDRS compute-DRS migration recommendations as VMM PRO Tips. This MP
+  is a structural starting point, not a drop-in deployable artifact — several
+  elements depend on the exact VMM/SCOM management pack version installed in the
+  target management group and MUST be confirmed/adjusted before import. Each such
+  element is flagged with a "CONFIRM" comment below. See ProPack/PROPACK.md for
+  the manual lab validation checklist; this XML has no automated test coverage.
+
+  Pipeline this MP implements:
+    Invoke-HvDrsProTipProbe.ps1 (TimedScript probe, runs Invoke-HvDRS -RecommendOnly
+      -PassThru -> ConvertTo-HvDrsProTip -> Resolve-VmmIdentity)
+    -> SCOM property bag(s) with RecommendationCount + per-recommendation fields
+    -> UnitMonitor (RecommendationCount > 0 -> Warning health state)
+    -> Alert (carries VM/host identity + justification text as alert parameters)
+    -> ProTip insertion rule -> VMM PRO Tip -> admin approval -> VMM's own
+       Move-SCVirtualMachine (HVDRS never executes the migration in this pack)
+-->
+<ManagementPack ContentReadable="true" SchemaVersion="2.0" OriginalSchemaVersion="1.1" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+
+  <Manifest>
+    <Identity>
+      <ID>HvDRS.ProTips</ID>
+      <Version>1.0.0.0</Version>
+    </Identity>
+    <Name>HVDRS PRO Tips</Name>
+    <References>
+      <Reference Alias="System">
+        <ID>System.Library</ID>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+        <Version>7.0.8437.0</Version>
+      </Reference>
+      <Reference Alias="Windows">
+        <ID>Microsoft.Windows.Library</ID>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+        <Version>7.0.8437.0</Version>
+      </Reference>
+      <Reference Alias="Health">
+        <ID>System.Health.Library</ID>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+        <Version>7.0.8437.0</Version>
+      </Reference>
+      <Reference Alias="SC">
+        <ID>Microsoft.SystemCenter.Library</ID>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+        <Version>7.0.8437.0</Version>
+      </Reference>
+      <!-- CONFIRM: exact VMM management pack ID/version installed in the target
+           management group (varies by VMM release). Find it with:
+             Get-SCOMManagementPack | Where-Object { $_.Name -like '*VirtualMachineManager*' }
+           and update the ID/Version below to match before import. -->
+      <Reference Alias="VMM">
+        <ID>Microsoft.SystemCenter.VirtualMachineManager.Library</ID>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+        <Version>7.0.8437.0</Version>
+      </Reference>
+    </References>
+  </Manifest>
+
+  <TypeDefinitions>
+
+    <SecureReferences>
+      <!-- Single Run-As account/profile carrying BOTH cluster-read rights (to run
+           Invoke-HvDRS -RecommendOnly) and VMM read rights (Get-SCVirtualMachine /
+           Get-SCVMHost). See PROPACK.md for the exact permission set — VMM-side
+           rights can be read-only since VMM executes the approved migration, not
+           this probe. -->
+      <SecureReference ID="HvDRS.ProTips.RunAsProfile" Accessibility="Public">
+        <Category>Action</Category>
+      </SecureReference>
+    </SecureReferences>
+
+    <ModuleTypes>
+      <ProbeActionModuleType ID="HvDRS.ProTips.ProbeModuleType" Accessibility="Internal" Batch="false" RunAs="HvDRS.ProTips.RunAsProfile">
+        <Configuration>
+          <xsd:element name="ClusterName" type="xsd:string" />
+          <xsd:element name="VMMServer" type="xsd:string" minOccurs="0" />
+          <xsd:element name="AggressionLevel" type="xsd:integer" minOccurs="0" />
+          <xsd:element name="IntervalSeconds" type="xsd:integer" />
+          <xsd:element name="SyncTime" type="xsd:string" minOccurs="0" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="AggressionLevel" Selector="$Config/AggressionLevel$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <ProbeAction ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </ProbeAction>
+              <!-- Tradeoff on IntervalSeconds (default 900s/15min, set by the
+                   monitor below): too short risks re-recommending a migration VMM
+                   hasn't finished applying yet; too long delays detection of new
+                   VM unhappiness. Tune per environment. -->
+              <ProbeAction ID="PropertyBagProbe" TypeID="Windows!Microsoft.Windows.TimedScript.PropertyBagProbe">
+                <ScriptName>Invoke-HvDrsProTipProbeWrapper.ps1</ScriptName>
+                <Arguments>-ClusterName "$Config/ClusterName$" -VMMServer "$Config/VMMServer$" -AggressionLevel $Config/AggressionLevel$</Arguments>
+                <!-- Per the standard TimedScript.PropertyBagProbe contract, the
+                     agent writes this script body to disk and executes it —
+                     ScriptName above is just the on-disk filename used for
+                     logging, not a path reference. This loader stub dot-sources
+                     the ProPack scripts deployed during install (see PROPACK.md
+                     Installation) and delegates to Invoke-HvDrsProTipProbe.
+                     CONFIRM/update $HvDrsProPackPath below to match the actual
+                     deployment path chosen on the SCOM management server. -->
+                <ScriptBody><![CDATA[
+param([string]$ClusterName, [string]$VMMServer, [int]$AggressionLevel = 3)
+
+$HvDrsProPackPath = 'C:\Program Files\HVDRS\ProPack\Scripts'
+
+Import-Module HVDRS -ErrorAction Stop
+. (Join-Path $HvDrsProPackPath 'ConvertTo-HvDrsProTip.ps1')
+. (Join-Path $HvDrsProPackPath 'Resolve-VmmIdentity.ps1')
+. (Join-Path $HvDrsProPackPath 'Invoke-HvDrsProTipProbe.ps1')
+
+Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -AggressionLevel $AggressionLevel
+]]></ScriptBody>
+                <SchedulerCookie>$Data/Context/Property[@Name='SchedulerCookie']$</SchedulerCookie>
+                <TimeoutSeconds>120</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PropertyBagProbe">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </ProbeActionModuleType>
+    </ModuleTypes>
+
+    <MonitorTypes>
+      <UnitMonitorType ID="HvDRS.ProTips.RecommendationMonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="NoRecommendation" NoDetection="false" />
+          <MonitorTypeState ID="RecommendationPending" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element name="ClusterName" type="xsd:string" />
+          <xsd:element name="VMMServer" type="xsd:string" minOccurs="0" />
+          <xsd:element name="AggressionLevel" type="xsd:integer" minOccurs="0" />
+          <xsd:element name="IntervalSeconds" type="xsd:integer" />
+          <xsd:element name="SyncTime" type="xsd:string" minOccurs="0" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="AggressionLevel" Selector="$Config/AggressionLevel$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="HvDRS.ProTips.ProbeModuleType">
+              <ClusterName>$Config/ClusterName$</ClusterName>
+              <VMMServer>$Config/VMMServer$</VMMServer>
+              <AggressionLevel>$Config/AggressionLevel$</AggressionLevel>
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime />
+            </DataSource>
+            <ConditionDetection ID="NoRecDetection" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="Integer">Property[@Name='RecommendationCount']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="Integer">0</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="RecPendingDetection" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="Integer">Property[@Name='RecommendationCount']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Greater</Operator>
+                  <ValueExpression>
+                    <Value Type="Integer">0</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="NoRecommendation">
+              <Node ID="NoRecDetection">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="RecommendationPending">
+              <Node ID="RecPendingDetection">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+
+  </TypeDefinitions>
+
+  <Monitoring>
+    <Monitors>
+      <!-- CONFIRM: exact target class name for a VMM-discovered Hyper-V host
+           cluster — this varies by installed VMM management pack version. Find
+           it with (run against your SCOM management group):
+             Get-SCOMClass | Where-Object { $_.DisplayName -like '*Host Cluster*' -or $_.DisplayName -like '*HostCluster*' }
+           and update the Target attribute below. Targeting the cluster (not a
+           per-host or per-VM class) matches how HVDRS's planner works — it needs
+           the whole cluster's node/VM snapshot to make one placement decision per
+           pass, not a per-host fragment of it. -->
+      <UnitMonitor ID="HvDRS.ProTips.RecommendationMonitor"
+                   Accessibility="Public"
+                   Enabled="true"
+                   Target="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"
+                   ParentMonitorID="Health!System.Health.AvailabilityState"
+                   Remotable="true"
+                   Priority="Normal"
+                   TypeID="HvDRS.ProTips.RecommendationMonitorType"
+                   ConfirmDelivery="false">
+        <Category>AvailabilityHealth</Category>
+        <AlertSettings AlertMessage="HvDRS.ProTips.AlertMessage">
+          <AlertOnState>Warning</AlertOnState>
+          <AutoResolve>true</AutoResolve>
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='VMName']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='SourceNode']$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Property[@Name='DestinationNode']$</AlertParameter3>
+            <AlertParameter4>$Data/Context/Property[@Name='Title']$</AlertParameter4>
+            <AlertParameter5>$Data/Context/Property[@Name='Description']$</AlertParameter5>
+            <AlertParameter6>$Data/Context/Property[@Name='Urgency']$</AlertParameter6>
+            <AlertParameter7>$Data/Context/Property[@Name='TriggerType']$</AlertParameter7>
+            <AlertParameter8>$Data/Context/Property[@Name='VMId']$</AlertParameter8>
+            <AlertParameter9>$Data/Context/Property[@Name='VMMVirtualMachineId']$</AlertParameter9>
+            <AlertParameter10>$Data/Context/Property[@Name='VMMHostId']$</AlertParameter10>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="NoRecommendationState" MonitorTypeStateID="NoRecommendation" HealthState="Success" />
+          <OperationalState ID="RecommendationPendingState" MonitorTypeStateID="RecommendationPending" HealthState="Warning" />
+        </OperationalStates>
+        <Configuration>
+          <!-- CONFIRM: property paths for the cluster's name and its managing VMM
+               server depend on the same VMM MP version as the Target class above. -->
+          <ClusterName>$Target/Property[Type="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"]/Name$</ClusterName>
+          <VMMServer>$Target/Host/Property[Type="VMM!Microsoft.SystemCenter.VirtualMachineManager.VMMServer"]/PrincipalName$</VMMServer>
+          <AggressionLevel>3</AggressionLevel>
+          <IntervalSeconds>900</IntervalSeconds>
+          <SyncTime />
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+
+    <Rules>
+      <!-- CONFIRM: the exact write-action module TypeID and its configuration
+           schema for inserting a VMM PRO Tip depend on the installed VMM PRO
+           framework version — confirm against Microsoft's VMM PRO MP
+           documentation / an existing vendor PRO pack for the target VMM release
+           before import. The structure below (a rule that fires on the monitor's
+           alert and feeds a ProTip write action) is the standard PRO provider
+           pattern; the concrete TypeID/element names are the part most likely to
+           need adjustment. -->
+      <Rule ID="HvDRS.ProTips.InsertionRule"
+            Enabled="true"
+            Target="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"
+            ConfirmDelivery="false"
+            Remotable="true"
+            Priority="Normal"
+            DiscardLevel="100">
+        <Category>Alert</Category>
+        <DataSources>
+          <DataSource ID="AlertDS" TypeID="Health!System.Health.AlertGeneratedDataSource">
+            <MonitorId>HvDRS.ProTips.RecommendationMonitor</MonitorId>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="ProTipWA" TypeID="VMM!Microsoft.SystemCenter.ProTipInsertionWriteAction">
+            <ProTipType>OptimizationRecommendation</ProTipType>
+            <Title>$Data/Context/DataItem/AlertParameter4$</Title>
+            <Description>$Data/Context/DataItem/AlertParameter5$</Description>
+            <Urgency>$Data/Context/DataItem/AlertParameter6$</Urgency>
+            <!-- VMM resolves these GUIDs to the SCVirtualMachine / SCVMHost
+                 objects that ConvertTo-HvDrsProTip + Resolve-VmmIdentity already
+                 matched in the probe — VMM's own Move-SCVirtualMachine executes
+                 against these on approval; this pack never calls it directly. -->
+            <TargetVMId>$Data/Context/DataItem/AlertParameter9$</TargetVMId>
+            <TargetHostId>$Data/Context/DataItem/AlertParameter10$</TargetHostId>
+          </WriteAction>
+        </WriteActions>
+      </Rule>
+    </Rules>
+  </Monitoring>
+
+  <Presentation>
+    <StringResources>
+      <StringResource ID="HvDRS.ProTips.AlertMessage" />
+    </StringResources>
+  </Presentation>
+
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <DisplayString ElementID="HvDRS.ProTips">
+          <Name>HVDRS PRO Tips</Name>
+          <Description>Surfaces HVDRS compute-DRS migration recommendations as VMM PRO Tips. Optional — the core HVDRS module has no dependency on this pack.</Description>
+        </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.RecommendationMonitor">
+          <Name>HVDRS Migration Recommendation</Name>
+          <Description>Detects pending HVDRS VM-happiness migration recommendations for this cluster.</Description>
+        </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.InsertionRule">
+          <Name>HVDRS PRO Tip Insertion Rule</Name>
+          <Description>Maps an HVDRS recommendation alert into a VMM PRO Tip.</Description>
+        </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.AlertMessage">
+          <Name>HVDRS recommends a VM migration</Name>
+          <Description>{0}: from {1} to {2}. {3} {4} (Urgency: {5}, Trigger: {6})</Description>
+        </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.RunAsProfile">
+          <Name>HVDRS PRO Tips Run As Account</Name>
+          <Description>Account requiring cluster-read rights (FailoverClusters/Hyper-V) and VMM read rights (Get-SCVirtualMachine/Get-SCVMHost). See PROPACK.md for the exact permission set.</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+
+</ManagementPack>

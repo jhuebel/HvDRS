@@ -27,6 +27,7 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 | **Recommend-Only mode** | `-RecommendOnly` switch for monitoring-only scheduled passes |
 | **Maintenance mode** | Lock-file mechanism to temporarily freeze both compute and storage migrations |
 | **Cluster discovery** | `Get-HvDRSCluster` lists nodes, VMs, and CSVs without collecting performance counters or proposing migrations |
+| **VMM PRO Tips (optional)** | Surfaces compute-DRS recommendations as VMM PRO Tips for admin approval inside the VMM console; VMM executes the approved migration — see [ProPack/PROPACK.md](ProPack/PROPACK.md) |
 
 ---
 
@@ -45,6 +46,16 @@ If your environment already runs System Center VMM, its **Dynamic Optimization (
 | Dependencies | Requires a licensed VMM management server (and SCOM for PRO/app-aware triggers) | Runs directly against the Failover Cluster — no management server required |
 
 **Net takeaway:** DO is effective at preventing gross cluster-wide imbalance, but it's a coarser instrument — it optimizes the *cluster's* variance, not any individual VM's experience. HVDRS is most worth using over DO when you care about catching VM-level unhappiness that a healthy-looking host average can hide, when you need real affinity (not just anti-affinity) or CSV-level storage balancing, or when you don't want to stand up/license SCVMM at all.
+
+---
+
+## Optional: VMM PRO Tips Integration
+
+If you *do* run VMM — and have it integrated with Operations Manager (SCOM) — HVDRS can surface its compute-DRS recommendations as **VMM PRO Tips**, so an admin sees and approves them from inside the VMM console instead of from `Invoke-HvDRS` console output or a scheduled task log. VMM executes the approved migration itself; HVDRS only ever runs in `-RecommendOnly` mode for this integration.
+
+This is a **fully optional, separately installed add-on** (`ProPack/`) implemented as a SCOM Management Pack — installing it adds zero dependencies to the core module, and uninstalling it (or never installing it) leaves `Invoke-HvDRS`/`Invoke-HvStorageDRS` completely unaffected.
+
+Prerequisites: SCOM integrated with VMM via the VMM connector, the VMM management pack imported into SCOM, and a Run-As account with cluster-read and VMM-read rights. See [ProPack/PROPACK.md](ProPack/PROPACK.md) for full setup, configuration, and testing details.
 
 ---
 
@@ -96,6 +107,11 @@ HVDRS/
         ├── Invoke-HvStorageDRS.ps1               # Storage DRS entry point
         ├── AffinityRules.ps1                     # Affinity rule CRUD + compute/storage compliance checks
         └── Maintenance.ps1                       # Enable/Disable/Get maintenance mode
+
+ProPack/                                          # Optional VMM PRO Tips add-on — see ProPack/PROPACK.md
+├── ManagementPack/HvDRS.ProTips.mp.xml           # SCOM Management Pack
+├── Scripts/                                      # Probe orchestrator + translation/identity-resolution helpers
+└── Tests/                                        # Pester tests for the scripts above
 ```
 
 ---

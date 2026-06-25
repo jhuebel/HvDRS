@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.4.0'
+    ModuleVersion     = '1.5.0'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -34,6 +34,15 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.5.0
+- Added -PassThru to Invoke-HvDRS: emits each migration recommendation as a structured
+  object (ClusterName, VMName, VMId, SourceNode, DestinationNode, scores, ComplianceReason)
+  in addition to the existing console output, for programmatic consumers. Fully additive
+  and backward compatible — omitting the switch preserves prior behavior.
+- Fixed internal Format-Table calls leaking formatting objects onto the function's output
+  stream when callers capture Invoke-HvDRS's return value; they now render to the console
+  only via Out-Host.
+
 ## 1.4.0
 - Added Get-HvDRSCluster: lightweight, read-only discovery of cluster nodes, VMs, and
   Cluster Shared Volumes, with no performance-counter collection and no migrations proposed

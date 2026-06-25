@@ -117,6 +117,14 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -RecommendOnly
 
 Unlike `-WhatIf` (which is typed interactively each time), `-RecommendOnly` is designed to be baked into a scheduled task action string to create a **permanent monitoring job** that logs happiness scores and recommendations without ever touching workloads.
 
+### Consume recommendations programmatically
+
+```powershell
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -RecommendOnly -PassThru | Format-List *
+```
+
+`-PassThru` emits each migration recommendation as a structured object (in addition to the normal console output) for scripts or external integrations that need the data rather than formatted text — e.g. the optional VMM PRO Tips integration in [`ProPack/PROPACK.md`](ProPack/PROPACK.md).
+
 ### Increase sampling accuracy
 
 Collect more CPU samples over a longer window before deciding:

@@ -108,6 +108,43 @@ function New-VmStorageMetrics {
     }
 }
 
+# ── ProPack helpers ────────────────────────────────────────────────────────────
+
+function New-MigrationRecommendation {
+    param(
+        [string] $ClusterName     = 'TEST-CLUSTER',
+        [object] $GeneratedAt     = (Get-Date),
+        [string] $VMName          = 'VM1',
+        [string] $VMId            = [System.Guid]::NewGuid().ToString(),
+        [string] $SourceNode      = 'NODE1',
+        [string] $DestinationNode = 'NODE2',
+        [float]  $CurrentScore        = 20.0,
+        [float]  $ProjectedScore      = 80.0,
+        [float]  $Improvement         = 60.0,
+        [float]  $CpuHappinessBefore  = 0.0,
+        [float]  $MemHappinessBefore  = 40.0,
+        [float]  $CpuHappinessAfter   = 100.0,
+        [float]  $MemHappinessAfter   = 100.0,
+        [object] $ComplianceReason    = $null
+    )
+    [PSCustomObject]@{
+        ClusterName        = $ClusterName
+        GeneratedAt        = $GeneratedAt
+        VMName             = $VMName
+        VMId               = $VMId
+        SourceNode         = $SourceNode
+        DestinationNode    = $DestinationNode
+        CurrentScore       = $CurrentScore
+        ProjectedScore     = $ProjectedScore
+        Improvement        = $Improvement
+        CpuHappinessBefore = $CpuHappinessBefore
+        MemHappinessBefore = $MemHappinessBefore
+        CpuHappinessAfter  = $CpuHappinessAfter
+        MemHappinessAfter  = $MemHappinessAfter
+        ComplianceReason   = $ComplianceReason
+    }
+}
+
 function New-StorageSnapshot {
     param(
         [string]           $ClusterName = 'TEST-CLUSTER',

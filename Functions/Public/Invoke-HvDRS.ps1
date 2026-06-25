@@ -81,6 +81,15 @@ function Invoke-HvDRS {
 
         Use Enable-HvDRSMaintenance / Disable-HvDRSMaintenance to manage the lock file.
 
+    .PARAMETER PassThru
+        Emit the migration recommendations to the pipeline as structured objects, in addition
+        to the normal console output. Each object carries ClusterName, GeneratedAt, VMName,
+        VMId, SourceNode, DestinationNode, CurrentScore, ProjectedScore, Improvement,
+        CpuHappinessBefore/After, MemHappinessBefore/After, and ComplianceReason.
+        Intended for programmatic consumers (e.g. a monitoring probe) that need the
+        recommendation data rather than formatted text. Has no effect on migration
+        execution behavior — combine with -RecommendOnly for a read-only, object-returning pass.
+
     .EXAMPLE
         # Dry run — see what would be moved without touching anything
         Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -WhatIf
@@ -135,7 +144,9 @@ function Invoke-HvDRS {
 
         [switch]$RecommendOnly,
 
-        [string]$MaintenanceLockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
+        [string]$MaintenanceLockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock'),
+
+        [switch]$PassThru
     )
 
     # ── Resolve cluster ────────────────────────────────────────────────────────
@@ -195,7 +206,7 @@ function Invoke-HvDRS {
         @{ N='Mem Used'; E={ '{0:N0} MB' -f $_.UsedMemoryMB } },
         @{ N='Mem Free'; E={ '{0:N0} MB' -f $_.AvailableMemoryMB } },
         @{ N='Net %';    E={ '{0:N1}' -f $_.NetworkUtilization } },
-        @{ N='VMs';      E={ $_.VMs.Count } }
+        @{ N='VMs';      E={ $_.VMs.Count } } | Out-Host
 
     # ── Phase 2: Check affinity rule compliance ────────────────────────────────
     if ($ruleSet.Count -gt 0) {
@@ -213,7 +224,7 @@ function Invoke-HvDRS {
                 @{ N='Type';     E={ $_.Type } },
                 @{ N='Hard';     E={ $_.Enforced } },
                 @{ N='VMs';      E={ $_.VMs -join ', ' } },
-                @{ N='Detail';   E={ $_.Description } }
+                @{ N='Detail';   E={ $_.Description } } | Out-Host
         } else {
             Write-Host ("{0} All {1} affinity rule(s) satisfied." -f (& $ts), $ruleSet.Count)
         }
@@ -238,7 +249,7 @@ function Invoke-HvDRS {
             if    ($_.HappinessScore -ge 80) { 'Happy' }
             elseif ($_.HappinessScore -ge 50) { 'Uncomfortable' }
             else                             { 'UNHAPPY' }
-        }}
+        }} | Out-Host
 
     # ── Phase 4: Find migration candidates ────────────────────────────────────
     $migrations = Find-MigrationCandidates -Snapshot $snapshot `
@@ -253,9 +264,30 @@ function Invoke-HvDRS {
                                            -ClusterName $ClusterName `
                                            -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
+    $generatedAt     = [DateTime]::Now
+    $passThruResults = foreach ($m in $migrations) {
+        [PSCustomObject]@{
+            ClusterName        = $ClusterName
+            GeneratedAt        = $generatedAt
+            VMName             = $m.VMName
+            VMId               = $m.VMId
+            SourceNode         = $m.SourceNode
+            DestinationNode    = $m.DestinationNode
+            CurrentScore       = $m.CurrentScore
+            ProjectedScore     = $m.ProjectedScore
+            Improvement        = $m.Improvement
+            CpuHappinessBefore = $m.CpuHappinessBefore
+            MemHappinessBefore = $m.MemHappinessBefore
+            CpuHappinessAfter  = $m.CpuHappinessAfter
+            MemHappinessAfter  = $m.MemHappinessAfter
+            ComplianceReason   = $m.ComplianceReason
+        }
+    }
+
     if (-not $migrations -or $migrations.Count -eq 0) {
         Write-Host ("{0} Cluster is balanced at aggression level {1}. No migrations needed." -f
             (& $ts), $AggressionLevel)
+        if ($PassThru) { Write-Output $passThruResults }
         return
     }
 
@@ -274,7 +306,7 @@ function Invoke-HvDRS {
             if ($_.ComplianceReason) {
                 'Compliance: ' + ($_.ComplianceReason.Substring(0, [Math]::Min(40, $_.ComplianceReason.Length)))
             } else { 'Happiness' }
-        }}
+        }} | Out-Host
 
     # ── Phase 5: Execute (or preview) migrations ───────────────────────────────
     if (-not $willMigrate) {
@@ -283,6 +315,7 @@ function Invoke-HvDRS {
         Write-Host ''
         Write-Host ("{0} HvDRS pass complete — {1} recommendation(s), no migrations executed." -f
             (& $ts), $migrations.Count)
+        if ($PassThru) { Write-Output $passThruResults }
         return
     }
 
@@ -324,4 +357,6 @@ function Invoke-HvDRS {
         Write-Host ("{0} HvDRS pass complete — {1} migrated, {2} failed." -f
             (& $ts), $succeeded, $failed)
     }
+
+    if ($PassThru) { Write-Output $passThruResults }
 }

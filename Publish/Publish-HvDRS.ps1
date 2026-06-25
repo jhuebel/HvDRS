@@ -122,7 +122,7 @@ if (-not $SkipTests -and -not $WhatIfPreference) {
 Write-Step 'Staging module files...'
 
 # Directories and files at the repo root that must NOT be included in the published module
-$excludeDirs  = @('Publish', 'Tests', '.git', '.claude')
+$excludeDirs  = @('Publish', 'Tests', 'ProPack', '.git', '.claude')
 $excludeFiles = @('PUBLISH.md', '.gitignore', '.gitattributes')
 
 $stageRoot  = Join-Path ([System.IO.Path]::GetTempPath()) "HvDRS-publish-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
