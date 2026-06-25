@@ -6,7 +6,7 @@ BeforeAll {
     # a real cluster, Hyper-V, or performance counters.
     function Get-HvDRSDataRoot { 'TestDrive:\' }
     function Get-Cluster { [PSCustomObject]@{ Name = 'TEST-CLUSTER' } }
-    function Get-AffinityRuleSet { param($Path, $ClusterName) @() }
+    function Get-AffinityRuleSet { param($Path, $ClusterName) ,@() }
     function Get-ClusterSnapshot {
         param($ClusterName, $SampleCount, $SampleIntervalSeconds)
         New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1') -VMs @()

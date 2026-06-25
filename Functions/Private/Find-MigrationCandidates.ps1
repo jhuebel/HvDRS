@@ -296,5 +296,9 @@ function Find-MigrationCandidates {
         & $applySimulatedMove $vm $bestMigration.SourceNode $bestMigration.DestinationNode
     }
 
+    # Leading comma only on the empty case — see Get-AffinityRuleSet.ps1 for why
+    # it must NOT be applied unconditionally (it would break single-recommendation
+    # callers that expect the bare migration object, not a 1-element array).
+    if ($migrations.Count -eq 0) { return ,@() }
     return $migrations
 }

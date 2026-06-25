@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.5.0'
+    ModuleVersion     = '1.5.1'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -34,6 +34,16 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.5.1
+- Fixed three latent bugs where a zero-match result collapsed to $null instead
+  of an empty array/collection at a function or switch-expression output
+  boundary: Find-MigrationCandidates (no migrations recommended),
+  Get-HvDRSAffinityRule (no rules match a filter), and an internal switch-to-
+  variable assignment in the same function. These were silently tolerated by
+  PowerShell's default null.Count convenience behavior but threw under
+  Set-StrictMode, which the publish pipeline enables — surfaced while
+  preparing this release. No behavior change for non-strict-mode callers.
+
 ## 1.5.0
 - Added -PassThru to Invoke-HvDRS: emits each migration recommendation as a structured
   object (ClusterName, VMName, VMId, SourceNode, DestinationNode, scores, ComplianceReason)

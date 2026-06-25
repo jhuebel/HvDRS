@@ -178,13 +178,21 @@ function Get-HvDRSAffinityRule {
 
     $rules = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
 
-    switch ($PSCmdlet.ParameterSetName) {
-        'ById'   { return @($rules | Where-Object { $_.RuleId -eq $RuleId }) }
-        'ByName' { return @($rules | Where-Object { $_.Name -like $Name }) }
-        'ByType' { return @($rules | Where-Object { $_.Type -eq $Type }) }
-        'ByVm'   { return @($rules | Where-Object { $_.VMs -contains $VmName }) }
-        default  { return @($rules) }
-    }
+    # Each branch assigns $matched directly (rather than using `switch` as an
+    # expression) — assigning the output of a switch/function call to a variable
+    # collapses an empty array to $null the same way a function return does; a
+    # plain `@(...)` assignment inside an if/elseif branch does not.
+    if     ($PSCmdlet.ParameterSetName -eq 'ById')   { $matched = @($rules | Where-Object { $_.RuleId -eq $RuleId }) }
+    elseif ($PSCmdlet.ParameterSetName -eq 'ByName') { $matched = @($rules | Where-Object { $_.Name -like $Name }) }
+    elseif ($PSCmdlet.ParameterSetName -eq 'ByType') { $matched = @($rules | Where-Object { $_.Type -eq $Type }) }
+    elseif ($PSCmdlet.ParameterSetName -eq 'ByVm')   { $matched = @($rules | Where-Object { $_.VMs -contains $VmName }) }
+    else                                              { $matched = @($rules) }
+
+    # Leading comma only on the empty case — see Get-AffinityRuleSet.ps1 for why
+    # it must NOT be applied unconditionally (it would break single-match
+    # callers that expect the bare rule object, not a 1-element array).
+    if ($matched.Count -eq 0) { return ,@() }
+    return $matched
 }
 
 function Remove-HvDRSAffinityRule {
