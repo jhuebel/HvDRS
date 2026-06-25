@@ -30,6 +30,24 @@ Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores eve
 
 ---
 
+## Why not just use SCVMM's Dynamic Optimization?
+
+If your environment already runs System Center VMM, its **Dynamic Optimization (DO)** feature is the closest built-in equivalent — it live-migrates VMs to balance CPU/memory/disk/network load across a host group on a schedule or on demand. HVDRS overlaps with DO in places (aggressiveness-style tuning, dry-run preview, possible-owner/host-group constraints) but takes a fundamentally different approach to deciding *when* a migration is warranted:
+
+| | SCVMM Dynamic Optimization | HVDRS |
+|---|---|---|
+| Balances at | **Host level** — minimizes the standard deviation of an aggregate load score across hosts | **VM level** — scores each VM's actual satisfaction against the resources it demands |
+| Memory signal | Host memory demand/free % | Hyper-V Dynamic Memory `Current Pressure` counter — distinguishes a comfortably ballooned VM from a genuinely starved one |
+| Blind spot | A host can look balanced on average while one VM is starved by NUMA placement, vCPU oversubscription, or a noisy neighbor — DO never sees it, because the host's aggregate score looks fine | Per-VM scoring catches exactly this case |
+| Destination selection | Network I/O factors into the host load score, but DO can still migrate a VM *onto* a host about to become a network bottleneck | Network-Aware destination filter explicitly excludes hosts above a NIC utilization threshold as migration targets |
+| Affinity | Anti-affinity only, via Availability Sets | Hard/soft affinity *and* anti-affinity, for both compute (VM↔VM, VM↔Host) and storage (VM↔CSV) |
+| Storage balancing | None — no Storage DRS equivalent; only manual/Quick Storage Migration | Storage DRS pass with CSV space + latency happiness scoring and storage affinity enforcement |
+| Dependencies | Requires a licensed VMM management server (and SCOM for PRO/app-aware triggers) | Runs directly against the Failover Cluster — no management server required |
+
+**Net takeaway:** DO is effective at preventing gross cluster-wide imbalance, but it's a coarser instrument — it optimizes the *cluster's* variance, not any individual VM's experience. HVDRS is most worth using over DO when you care about catching VM-level unhappiness that a healthy-looking host average can hide, when you need real affinity (not just anti-affinity) or CSV-level storage balancing, or when you don't want to stand up/license SCVMM at all.
+
+---
+
 ## Quick Start
 
 ```powershell
