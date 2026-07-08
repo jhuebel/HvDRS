@@ -9,7 +9,7 @@
   element is flagged with a "CONFIRM" comment below. See ProPack/PROPACK.md for
   the manual lab validation checklist; this XML has no automated test coverage.
 
-  Pipeline this MP implements:
+  Pipeline this MP implements (compute):
     Invoke-HvDrsProTipProbe.ps1 (TimedScript probe, runs Invoke-HvDRS -RecommendOnly
       -PassThru -> ConvertTo-HvDrsProTip -> Resolve-VmmIdentity)
     -> SCOM property bag(s) with RecommendationCount + per-recommendation fields
@@ -17,13 +17,20 @@
     -> Alert (carries VM/host identity + justification text as alert parameters)
     -> ProTip insertion rule -> VMM PRO Tip -> admin approval -> VMM's own
        Move-SCVirtualMachine (HVDRS never executes the migration in this pack)
+
+  A second, parallel pipeline (storage) mirrors the above exactly, using
+  Invoke-HvDrsStorageProTipProbe.ps1 (-> ConvertTo-HvDrsStorageProTip ->
+  Resolve-VmmStorageIdentity) and its own ProbeModuleType/MonitorType/Monitor/
+  Rule (the "HvDRS.ProTips.Storage*" elements below) so a storage recommendation
+  never collides with a compute one on the same cluster. VMM executes the
+  approved storage move itself; this pack never calls Move-VMStorage directly.
 -->
 <ManagementPack ContentReadable="true" SchemaVersion="2.0" OriginalSchemaVersion="1.1" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
 
   <Manifest>
     <Identity>
       <ID>HvDRS.ProTips</ID>
-      <Version>1.0.0.0</Version>
+      <Version>1.1.0.0</Version>
     </Identity>
     <Name>HVDRS PRO Tips</Name>
     <References>
@@ -137,6 +144,72 @@ Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -Aggress
         </ModuleImplementation>
         <OutputType>System!System.PropertyBagData</OutputType>
       </ProbeActionModuleType>
+
+      <!-- Storage counterpart of HvDRS.ProTips.ProbeModuleType above — same
+           structure, delegates to Invoke-HvDrsStorageProTipProbe instead. -->
+      <ProbeActionModuleType ID="HvDRS.ProTips.StorageProbeModuleType" Accessibility="Internal" Batch="false" RunAs="HvDRS.ProTips.RunAsProfile">
+        <Configuration>
+          <xsd:element name="ClusterName" type="xsd:string" />
+          <xsd:element name="VMMServer" type="xsd:string" minOccurs="0" />
+          <xsd:element name="AggressionLevel" type="xsd:integer" minOccurs="0" />
+          <xsd:element name="IntervalSeconds" type="xsd:integer" />
+          <xsd:element name="SyncTime" type="xsd:string" minOccurs="0" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="AggressionLevel" Selector="$Config/AggressionLevel$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <ProbeAction ID="Scheduler" TypeID="System!System.Scheduler">
+                <Scheduler>
+                  <SimpleReccuringSchedule>
+                    <Interval Unit="Seconds">$Config/IntervalSeconds$</Interval>
+                    <SyncTime>$Config/SyncTime$</SyncTime>
+                  </SimpleReccuringSchedule>
+                  <ExcludeDates />
+                </Scheduler>
+              </ProbeAction>
+              <!-- Same IntervalSeconds tradeoff as the compute probe — a storage
+                   move typically takes longer than a live migration, so consider
+                   a slightly longer interval than the compute monitor's if you
+                   override this per-cluster. -->
+              <ProbeAction ID="PropertyBagProbe" TypeID="Windows!Microsoft.Windows.TimedScript.PropertyBagProbe">
+                <ScriptName>Invoke-HvDrsStorageProTipProbeWrapper.ps1</ScriptName>
+                <Arguments>-ClusterName "$Config/ClusterName$" -VMMServer "$Config/VMMServer$" -AggressionLevel $Config/AggressionLevel$</Arguments>
+                <!-- Same TimedScript.PropertyBagProbe contract as the compute
+                     probe (see its ScriptBody comment above). Dot-sources
+                     Invoke-HvDrsProTipProbe.ps1 too, purely for the shared
+                     New-HvDrsScriptApi COM wrapper it defines — not to invoke
+                     the compute probe itself. CONFIRM/update $HvDrsProPackPath
+                     below to match the actual deployment path. -->
+                <ScriptBody><![CDATA[
+param([string]$ClusterName, [string]$VMMServer, [int]$AggressionLevel = 3)
+
+$HvDrsProPackPath = 'C:\Program Files\HVDRS\ProPack\Scripts'
+
+Import-Module HVDRS -ErrorAction Stop
+. (Join-Path $HvDrsProPackPath 'Invoke-HvDrsProTipProbe.ps1')
+. (Join-Path $HvDrsProPackPath 'ConvertTo-HvDrsStorageProTip.ps1')
+. (Join-Path $HvDrsProPackPath 'Resolve-VmmStorageIdentity.ps1')
+. (Join-Path $HvDrsProPackPath 'Invoke-HvDrsStorageProTipProbe.ps1')
+
+Invoke-HvDrsStorageProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -AggressionLevel $AggressionLevel
+]]></ScriptBody>
+                <SchedulerCookie>$Data/Context/Property[@Name='SchedulerCookie']$</SchedulerCookie>
+                <TimeoutSeconds>120</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PropertyBagProbe">
+                <Node ID="Scheduler" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </ProbeActionModuleType>
     </ModuleTypes>
 
     <MonitorTypes>
@@ -159,6 +232,75 @@ Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -Aggress
         <MonitorImplementation>
           <MemberModules>
             <DataSource ID="DS" TypeID="HvDRS.ProTips.ProbeModuleType">
+              <ClusterName>$Config/ClusterName$</ClusterName>
+              <VMMServer>$Config/VMMServer$</VMMServer>
+              <AggressionLevel>$Config/AggressionLevel$</AggressionLevel>
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime />
+            </DataSource>
+            <ConditionDetection ID="NoRecDetection" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="Integer">Property[@Name='RecommendationCount']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="Integer">0</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="RecPendingDetection" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="Integer">Property[@Name='RecommendationCount']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Greater</Operator>
+                  <ValueExpression>
+                    <Value Type="Integer">0</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="NoRecommendation">
+              <Node ID="NoRecDetection">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="RecommendationPending">
+              <Node ID="RecPendingDetection">
+                <Node ID="DS" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+
+      <!-- Storage counterpart of HvDRS.ProTips.RecommendationMonitorType above —
+           identical structure, sourced from HvDRS.ProTips.StorageProbeModuleType. -->
+      <UnitMonitorType ID="HvDRS.ProTips.StorageRecommendationMonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="NoRecommendation" NoDetection="false" />
+          <MonitorTypeState ID="RecommendationPending" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element name="ClusterName" type="xsd:string" />
+          <xsd:element name="VMMServer" type="xsd:string" minOccurs="0" />
+          <xsd:element name="AggressionLevel" type="xsd:integer" minOccurs="0" />
+          <xsd:element name="IntervalSeconds" type="xsd:integer" />
+          <xsd:element name="SyncTime" type="xsd:string" minOccurs="0" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="AggressionLevel" Selector="$Config/AggressionLevel$" ParameterType="int" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DS" TypeID="HvDRS.ProTips.StorageProbeModuleType">
               <ClusterName>$Config/ClusterName$</ClusterName>
               <VMMServer>$Config/VMMServer$</VMMServer>
               <AggressionLevel>$Config/AggressionLevel$</AggressionLevel>
@@ -262,6 +404,50 @@ Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -Aggress
           <SyncTime />
         </Configuration>
       </UnitMonitor>
+
+      <!-- Storage counterpart of HvDRS.ProTips.RecommendationMonitor above —
+           same CONFIRM caveats (Target class, ClusterName/VMMServer property
+           paths) apply, since it targets the same VMM-discovered host cluster. -->
+      <UnitMonitor ID="HvDRS.ProTips.StorageRecommendationMonitor"
+                   Accessibility="Public"
+                   Enabled="true"
+                   Target="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"
+                   ParentMonitorID="Health!System.Health.AvailabilityState"
+                   Remotable="true"
+                   Priority="Normal"
+                   TypeID="HvDRS.ProTips.StorageRecommendationMonitorType"
+                   ConfirmDelivery="false">
+        <Category>AvailabilityHealth</Category>
+        <AlertSettings AlertMessage="HvDRS.ProTips.StorageAlertMessage">
+          <AlertOnState>Warning</AlertOnState>
+          <AutoResolve>true</AutoResolve>
+          <AlertPriority>Normal</AlertPriority>
+          <AlertSeverity>MatchMonitorHealth</AlertSeverity>
+          <AlertParameters>
+            <AlertParameter1>$Data/Context/Property[@Name='VMName']$</AlertParameter1>
+            <AlertParameter2>$Data/Context/Property[@Name='SourceCSVName']$</AlertParameter2>
+            <AlertParameter3>$Data/Context/Property[@Name='DestinationCSVName']$</AlertParameter3>
+            <AlertParameter4>$Data/Context/Property[@Name='Title']$</AlertParameter4>
+            <AlertParameter5>$Data/Context/Property[@Name='Description']$</AlertParameter5>
+            <AlertParameter6>$Data/Context/Property[@Name='Urgency']$</AlertParameter6>
+            <AlertParameter7>$Data/Context/Property[@Name='TriggerType']$</AlertParameter7>
+            <AlertParameter8>$Data/Context/Property[@Name='VMId']$</AlertParameter8>
+            <AlertParameter9>$Data/Context/Property[@Name='VMMVirtualMachineId']$</AlertParameter9>
+            <AlertParameter10>$Data/Context/Property[@Name='VMMStorageVolumeId']$</AlertParameter10>
+          </AlertParameters>
+        </AlertSettings>
+        <OperationalStates>
+          <OperationalState ID="NoRecommendationState" MonitorTypeStateID="NoRecommendation" HealthState="Success" />
+          <OperationalState ID="RecommendationPendingState" MonitorTypeStateID="RecommendationPending" HealthState="Warning" />
+        </OperationalStates>
+        <Configuration>
+          <ClusterName>$Target/Property[Type="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"]/Name$</ClusterName>
+          <VMMServer>$Target/Host/Property[Type="VMM!Microsoft.SystemCenter.VirtualMachineManager.VMMServer"]/PrincipalName$</VMMServer>
+          <AggressionLevel>3</AggressionLevel>
+          <IntervalSeconds>900</IntervalSeconds>
+          <SyncTime />
+        </Configuration>
+      </UnitMonitor>
     </Monitors>
 
     <Rules>
@@ -301,12 +487,53 @@ Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -Aggress
           </WriteAction>
         </WriteActions>
       </Rule>
+
+      <!-- Storage counterpart of HvDRS.ProTips.InsertionRule above.
+           CONFIRM (in addition to the write-action caveats noted above): whether
+           your installed VMM PRO framework version's ProTipInsertionWriteAction
+           schema exposes a distinct "target storage volume" element for a
+           storage-move recommendation (as opposed to only TargetVMId/TargetHostId
+           for a compute move) — this is the part of the pattern most likely to
+           differ from the compute rule and needs verification against your VMM
+           release's PRO documentation before import. TargetHostId is set to the
+           VM's current host (unchanged by a storage-only move); the resolved
+           VMM storage volume ID is carried in AlertParameter10 in case your VMM
+           version's write action needs it under a different element name. -->
+      <Rule ID="HvDRS.ProTips.StorageInsertionRule"
+            Enabled="true"
+            Target="VMM!Microsoft.SystemCenter.VirtualMachineManager.HostCluster"
+            ConfirmDelivery="false"
+            Remotable="true"
+            Priority="Normal"
+            DiscardLevel="100">
+        <Category>Alert</Category>
+        <DataSources>
+          <DataSource ID="AlertDS" TypeID="Health!System.Health.AlertGeneratedDataSource">
+            <MonitorId>HvDRS.ProTips.StorageRecommendationMonitor</MonitorId>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="ProTipWA" TypeID="VMM!Microsoft.SystemCenter.ProTipInsertionWriteAction">
+            <ProTipType>OptimizationRecommendation</ProTipType>
+            <Title>$Data/Context/DataItem/AlertParameter4$</Title>
+            <Description>$Data/Context/DataItem/AlertParameter5$</Description>
+            <Urgency>$Data/Context/DataItem/AlertParameter6$</Urgency>
+            <!-- VMM resolves this GUID to the SCVirtualMachine object that
+                 ConvertTo-HvDrsStorageProTip + Resolve-VmmStorageIdentity already
+                 matched in the probe — VMM's own storage-move job executes
+                 against it (and the resolved destination volume, AlertParameter10)
+                 on approval; this pack never calls Move-VMStorage directly. -->
+            <TargetVMId>$Data/Context/DataItem/AlertParameter9$</TargetVMId>
+          </WriteAction>
+        </WriteActions>
+      </Rule>
     </Rules>
   </Monitoring>
 
   <Presentation>
     <StringResources>
       <StringResource ID="HvDRS.ProTips.AlertMessage" />
+      <StringResource ID="HvDRS.ProTips.StorageAlertMessage" />
     </StringResources>
   </Presentation>
 
@@ -315,23 +542,35 @@ Invoke-HvDrsProTipProbe -ClusterName $ClusterName -VMMServer $VMMServer -Aggress
       <DisplayStrings>
         <DisplayString ElementID="HvDRS.ProTips">
           <Name>HVDRS PRO Tips</Name>
-          <Description>Surfaces HVDRS compute-DRS migration recommendations as VMM PRO Tips. Optional — the core HVDRS module has no dependency on this pack.</Description>
+          <Description>Surfaces HVDRS compute-DRS and storage-DRS migration recommendations as VMM PRO Tips. Optional — the core HVDRS module has no dependency on this pack.</Description>
         </DisplayString>
         <DisplayString ElementID="HvDRS.ProTips.RecommendationMonitor">
           <Name>HVDRS Migration Recommendation</Name>
           <Description>Detects pending HVDRS VM-happiness migration recommendations for this cluster.</Description>
         </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.StorageRecommendationMonitor">
+          <Name>HVDRS Storage Migration Recommendation</Name>
+          <Description>Detects pending HVDRS CSV-happiness storage migration recommendations for this cluster.</Description>
+        </DisplayString>
         <DisplayString ElementID="HvDRS.ProTips.InsertionRule">
           <Name>HVDRS PRO Tip Insertion Rule</Name>
-          <Description>Maps an HVDRS recommendation alert into a VMM PRO Tip.</Description>
+          <Description>Maps an HVDRS compute recommendation alert into a VMM PRO Tip.</Description>
+        </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.StorageInsertionRule">
+          <Name>HVDRS Storage PRO Tip Insertion Rule</Name>
+          <Description>Maps an HVDRS storage recommendation alert into a VMM PRO Tip.</Description>
         </DisplayString>
         <DisplayString ElementID="HvDRS.ProTips.AlertMessage">
           <Name>HVDRS recommends a VM migration</Name>
           <Description>{0}: from {1} to {2}. {3} {4} (Urgency: {5}, Trigger: {6})</Description>
         </DisplayString>
+        <DisplayString ElementID="HvDRS.ProTips.StorageAlertMessage">
+          <Name>HVDRS recommends a VM storage migration</Name>
+          <Description>{0}: from {1} to {2}. {3} {4} (Urgency: {5}, Trigger: {6})</Description>
+        </DisplayString>
         <DisplayString ElementID="HvDRS.ProTips.RunAsProfile">
           <Name>HVDRS PRO Tips Run As Account</Name>
-          <Description>Account requiring cluster-read rights (FailoverClusters/Hyper-V) and VMM read rights (Get-SCVirtualMachine/Get-SCVMHost). See PROPACK.md for the exact permission set.</Description>
+          <Description>Account requiring cluster-read rights (FailoverClusters/Hyper-V) and VMM read rights (Get-SCVirtualMachine/Get-SCVMHost/Get-SCStorageVolume). See PROPACK.md for the exact permission set.</Description>
         </DisplayString>
       </DisplayStrings>
     </LanguagePack>

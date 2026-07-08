@@ -7,6 +7,7 @@ BeforeAll {
     function Get-HvDRSDataRoot { 'TestDrive:\' }
     function Get-Cluster { [PSCustomObject]@{ Name = 'TEST-CLUSTER' } }
     function Get-AffinityRuleSet { param($Path, $ClusterName) ,@() }
+    function Get-HvDRSAutomationOverrideSet { param($Path, $ClusterName) ,@() }
     function Get-ClusterSnapshot {
         param($ClusterName, $SampleCount, $SampleIntervalSeconds)
         New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1') -VMs @()
@@ -100,5 +101,76 @@ Describe 'Invoke-HvDRS -PassThru' {
         $result = Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -RecommendOnly -PassThru 6>$null
 
         $result[0].ComplianceReason | Should -Be 'Anti-affinity violation'
+    }
+}
+
+Describe 'Invoke-HvDRS automation-level overrides' {
+
+    It 'recommends but does not migrate a VM pinned to Manual, while still migrating other VMs' {
+        Mock Find-MigrationCandidates {
+            @(
+                (New-Recommendation -VMName 'PINNED-VM' -SourceNode 'NODE1' -DestinationNode 'NODE2'),
+                (New-Recommendation -VMName 'AUTO-VM'   -SourceNode 'NODE1' -DestinationNode 'NODE2')
+            )
+        }
+        Mock Get-HvDRSAutomationOverrideSet {
+            @([PSCustomObject]@{ ClusterName = 'TEST-CLUSTER'; VMName = 'PINNED-VM'; AutomationLevel = 'Manual' })
+        }
+        Mock Move-ClusterVirtualMachineRole { }
+
+        $result = Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -PassThru 6>$null
+
+        $result.Count | Should -Be 2   # both still show up as recommendations
+        Should -Invoke Move-ClusterVirtualMachineRole -Times 0 -ParameterFilter { $Name -eq 'PINNED-VM' }
+        Should -Invoke Move-ClusterVirtualMachineRole -Times 1 -ParameterFilter { $Name -eq 'AUTO-VM' }
+    }
+
+    It 'migrates normally when no override applies' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Get-HvDRSAutomationOverrideSet { ,@() }
+        Mock Move-ClusterVirtualMachineRole { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' 6>$null | Out-Null
+
+        Should -Invoke Move-ClusterVirtualMachineRole -Times 1
+    }
+}
+
+Describe 'Invoke-HvDRS notifications' {
+
+    BeforeEach {
+        function Send-HvDRSNotification { param($Payload, $WebhookUrl, $WriteEventLog) }
+    }
+
+    It 'does not call Send-HvDRSNotification when neither -WebhookUrl nor -WriteEventLog is set' {
+        Mock Find-MigrationCandidates { @() }
+        Mock Send-HvDRSNotification { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -RecommendOnly 6>$null | Out-Null
+
+        Should -Invoke Send-HvDRSNotification -Times 0
+    }
+
+    It 'calls Send-HvDRSNotification with a summary payload when -WebhookUrl is set (balanced cluster)' {
+        Mock Find-MigrationCandidates { @() }
+        Mock Send-HvDRSNotification { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -RecommendOnly -WebhookUrl 'https://example.test/hook' 6>$null | Out-Null
+
+        Should -Invoke Send-HvDRSNotification -Times 1 -ParameterFilter {
+            $WebhookUrl -eq 'https://example.test/hook' -and $Payload.ClusterName -eq 'TEST-CLUSTER' -and $Payload.RecommendationCount -eq 0
+        }
+    }
+
+    It 'calls Send-HvDRSNotification once after a normal migration pass with correct counts' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Move-ClusterVirtualMachineRole { }
+        Mock Send-HvDRSNotification { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -WriteEventLog -Confirm:$false 6>$null | Out-Null
+
+        Should -Invoke Send-HvDRSNotification -Times 1 -ParameterFilter {
+            $WriteEventLog -eq $true -and $Payload.RecommendationCount -eq 1 -and $Payload.ExecutedCount -eq 1 -and $Payload.FailedCount -eq 0
+        }
     }
 }

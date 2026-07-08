@@ -20,6 +20,8 @@ Invoke-HvDRS
     [-AggressionLevel <Int32>]
     [-SampleCount <Int32>]
     [-SampleIntervalSeconds <Int32>]
+    [-TrendWindow <Int32>]
+    [-HistoryPath <String>]
     [-CpuWeight <Single>]
     [-MemoryWeight <Single>]
     [-MaxDestinationNetworkUtil <Single>]
@@ -29,6 +31,10 @@ Invoke-HvDRS
     [-RuleComplianceBonus <Single>]
     [-RecommendOnly]
     [-MaintenanceLockFile <String>]
+    [-AutomationOverridesPath <String>]
+    [-WebhookUrl <String>]
+    [-WriteEventLog]
+    [-PassThru]
     [-WhatIf]
     [-Verbose]
 ```
@@ -41,6 +47,8 @@ Invoke-HvDRS
 | `-AggressionLevel` | Int (1–5) | 3 | Migration sensitivity (see table below) |
 | `-SampleCount` | Int | 5 | CPU counter samples to average per node |
 | `-SampleIntervalSeconds` | Int | 2 | Seconds between CPU samples |
+| `-TrendWindow` | Int (1–10) | 1 | Passes to average node CPU/network and VM CPU/memory-pressure over before scoring; 1 = disabled (see [Trend Smoothing](#trend-smoothing) below) |
+| `-HistoryPath` | String | `$env:ProgramData\HvDRS\history\<ClusterName>.json` | Rolling history file used when `-TrendWindow` > 1 |
 | `-CpuWeight` | Float (0–1) | 0.5 | CPU happiness weight in combined score |
 | `-MemoryWeight` | Float (0–1) | 0.5 | Memory happiness weight in combined score |
 | `-MaxDestinationNetworkUtil` | Float (0–100) | 70.0 | NIC utilization % above which a node is excluded as a migration target |
@@ -50,6 +58,10 @@ Invoke-HvDRS
 | `-RuleComplianceBonus` | Float (0–100) | 25.0 | Score bonus applied when a proposed move would fix an existing soft rule violation |
 | `-RecommendOnly` | Switch | — | Print recommendations but never execute migrations |
 | `-MaintenanceLockFile` | String | `$env:ProgramData\HvDRS\maintenance.lock` | Path to the maintenance lock file checked each pass |
+| `-AutomationOverridesPath` | String | `$env:ProgramData\HvDRS\automation-overrides.json` | Path to the per-VM automation-level override store (see [Per-VM Automation-Level Overrides](#per-vm-automation-level-overrides)) |
+| `-WebhookUrl` | String | — | POST a JSON pass summary to this URL on completion (see [Notifications](#webhook--event-log-notifications)) |
+| `-WriteEventLog` | Switch | — | Write the same JSON pass summary to the Application event log (source `HVDRS`) |
+| `-PassThru` | Switch | — | Emit structured recommendation objects to the pipeline in addition to console output |
 | `-WhatIf` | Switch | — | Standard PowerShell dry-run; shows what would be done |
 | `-Verbose` | Switch | — | Prints per-node collection progress |
 
@@ -135,6 +147,22 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -SampleCount 10 -SampleIntervalSeconds 
 
 ---
 
+## Trend Smoothing
+
+`-SampleCount`/`-SampleIntervalSeconds` average CPU counter samples *within* one pass. `-TrendWindow` goes further: it averages a node's CPU/network utilization and a VM's CPU/memory-pressure *across consecutive passes*, so a single unlucky sample (a brief spike caught right at collection time) doesn't trigger a migration a moment later would have shown was unnecessary.
+
+```powershell
+# Average this pass with the previous 2 (3-pass rolling window)
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -TrendWindow 3
+```
+
+- Default is `-TrendWindow 1` — disabled, identical to prior behavior. No history file is written unless you opt in.
+- History persists at `-HistoryPath` (default `$env:ProgramData\HvDRS\history\<ClusterName>.json`) between calls — this only makes sense for a **recurring** job (a scheduled task running `Invoke-HvDRS` every few minutes), since a single one-off run has nothing to average against yet.
+- Capacity fields (free memory, logical processor count) are never smoothed — they reflect current headroom, not a multi-pass trend.
+- A VM or node that appears in only some of the recent passes (added/removed between them) is simply averaged over however many entries it does appear in.
+
+---
+
 ## Maintenance Mode
 
 Maintenance mode suspends all migration execution — for both `Invoke-HvDRS` and `Invoke-HvStorageDRS` — without modifying Task Scheduler or the scheduled task action. Drop the lock file to pause; delete it to resume.
@@ -187,6 +215,31 @@ HvDRS maintenance mode DISABLED. Automatic migrations will resume on the next pa
 # Preview lock file creation without actually creating it
 Enable-HvDRSMaintenance -Reason 'Test' -WhatIf
 ```
+
+---
+
+## Node Maintenance Mode (Evacuation)
+
+`Enable-HvDRSMaintenance` (above) freezes migrations cluster-wide but doesn't move anything off a specific node. `Enter-HvDRSNodeMaintenance` is the complementary, active operation — a Hyper-V-cluster analog of vSphere's "Enter Maintenance Mode": it live-migrates every VM off a named node using the same happiness-aware destination selection `Invoke-HvDRS` uses (Network-Aware gate, memory reserve, possible-owner constraints, affinity-rule impact), then pauses the node so it stops receiving new placements.
+
+```powershell
+# Preview the evacuation plan without moving anything or pausing the node
+Enter-HvDRSNodeMaintenance -ClusterName 'PROD-CLUSTER' -NodeName 'HV-NODE3' -WhatIf
+
+# Drain and pause the node for real
+Enter-HvDRSNodeMaintenance -ClusterName 'PROD-CLUSTER' -NodeName 'HV-NODE3'
+
+# ... perform hardware/OS maintenance on HV-NODE3 ...
+
+# Resume the node so it can receive placements again
+Exit-HvDRSNodeMaintenance -ClusterName 'PROD-CLUSTER' -NodeName 'HV-NODE3'
+
+# Check paused/up state for all nodes (or a specific one)
+Get-HvDRSNodeMaintenanceStatus -ClusterName 'PROD-CLUSTER'
+Get-HvDRSNodeMaintenanceStatus -ClusterName 'PROD-CLUSTER' -NodeName 'HV-NODE3'
+```
+
+If any VM on the node has no valid destination (e.g. a hard `VmHostAffinity` rule leaves nowhere else it's allowed to run), **the node is not paused** — pausing it would strand that VM there indefinitely. The returned object's `AllPlaced` / `NodePaused` fields report this; check them (or the console warning) before assuming the node is safe to take down.
 
 ---
 
@@ -276,6 +329,10 @@ Invoke-HvStorageDRS
     [-MinFreeGBReserve <Int32>]
     [-RecommendOnly]
     [-MaintenanceLockFile <String>]
+    [-AutomationOverridesPath <String>]
+    [-WebhookUrl <String>]
+    [-WriteEventLog]
+    [-PassThru]
     [-WhatIf]
     [-Verbose]
 ```
@@ -293,6 +350,10 @@ Invoke-HvStorageDRS
 | `-MinFreeGBReserve` | Int | 50 | Free space (GB) that must remain on the destination CSV after VHDs land |
 | `-RecommendOnly` | Switch | — | Print the migration plan but never call Move-VMStorage |
 | `-MaintenanceLockFile` | String | `$env:ProgramData\HvDRS\maintenance.lock` | Shared with Invoke-HvDRS; one lock file pauses both |
+| `-AutomationOverridesPath` | String | `$env:ProgramData\HvDRS\automation-overrides.json` | Shared with Invoke-HvDRS — a VM pinned to Manual (see [Per-VM Automation-Level Overrides](#per-vm-automation-level-overrides)) gets a storage recommendation but is never moved |
+| `-WebhookUrl` | String | — | POST a JSON pass summary to this URL on completion |
+| `-WriteEventLog` | Switch | — | Write the same JSON pass summary to the Application event log (source `HVDRS`) |
+| `-PassThru` | Switch | — | Emit structured storage recommendation objects to the pipeline in addition to console output — consumed by the optional ProPack storage PRO Tips probe (see [ProPack/PROPACK.md](../ProPack/PROPACK.md)) |
 | `-WhatIf` | Switch | — | Standard PowerShell dry-run |
 | `-Verbose` | Switch | — | Shows per-CSV counter collection progress |
 
@@ -519,6 +580,94 @@ Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'App Affinity' -Type VmV
 # Run HvDRS against the same file
 Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -RulesPath D:\Config\my-rules.json
 ```
+
+---
+
+## VM/Host/CSV Groups
+
+Instead of listing the same VMs, hosts, or CSVs directly on multiple rules, define a reusable named group once and reference it — the same "VM/Host DRS Group" concept vSphere exposes. Group membership is resolved **dynamically** every time a rule is loaded: editing a group with `Set-HvDRSGroup` takes effect on the very next `Invoke-HvDRS`/`Invoke-HvStorageDRS` pass, with no need to touch the rules that reference it.
+
+```powershell
+# Define a group of VMs
+Add-HvDRSGroup -ClusterName 'PROD-CLUSTER' -Name 'SQL VMs' -Type Vm -Members 'SQL-PROD-01','SQL-PROD-02','SQL-PROD-03'
+
+# Define a group of hosts
+Add-HvDRSGroup -ClusterName 'PROD-CLUSTER' -Name 'Rack A' -Type Host -Members 'HV-NODE1','HV-NODE2'
+
+# Define a group of CSVs
+Add-HvDRSGroup -ClusterName 'PROD-CLUSTER' -Name 'Tier1 Storage' -Type Csv -Members 'Volume1','Volume2'
+
+# Reference groups from a rule instead of (or alongside) literal names
+Add-HvDRSAffinityRule -ClusterName 'PROD-CLUSTER' -Name 'SQL Rack Affinity' `
+                      -Type VmHostAffinity -VMGroups 'SQL VMs' -HostGroups 'Rack A' -Enforced
+
+# Add a new VM to the group later — SQL Rack Affinity picks it up automatically
+Set-HvDRSGroup -GroupId (Get-HvDRSGroup -ClusterName 'PROD-CLUSTER' -Name 'SQL VMs').GroupId -AddMembers 'SQL-PROD-04'
+
+# List / remove groups
+Get-HvDRSGroup -ClusterName 'PROD-CLUSTER'
+Remove-HvDRSGroup -ClusterName 'PROD-CLUSTER' -Name 'Rack A'
+```
+
+`Add-HvDRSAffinityRule`/`Set-HvDRSAffinityRule` accept `-VMGroups`/`-HostGroups`/`-CSVGroups` alongside the existing `-VMs`/`-Hosts`/`-CSVs` — a rule's final membership at evaluation time is the union of both. Groups are stored separately (`$env:ProgramData\HvDRS\groups.json` by default) and, like rules, are scoped per cluster.
+
+---
+
+## Per-VM Automation-Level Overrides
+
+Pin a specific VM to **Manual** automation so HVDRS keeps scoring and recommending migrations for it — the recommendation still shows up in console output and `-PassThru` results — but never actually executes one, mirroring vSphere DRS's per-VM automation-level override. Useful for a change-managed workload that needs a human to approve every move.
+
+```powershell
+# Pin a VM to Manual
+Set-HvDRSVMAutomationLevel -ClusterName 'PROD-CLUSTER' -VMName 'SQL-PROD-01' -AutomationLevel Manual -Reason 'Change-managed workload'
+
+# Invoke-HvDRS / Invoke-HvStorageDRS now skip execution for this VM only —
+# console output shows "Skipping 'SQL-PROD-01' — pinned to Manual automation"
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER'
+
+# List current overrides
+Get-HvDRSVMAutomationLevel -ClusterName 'PROD-CLUSTER'
+
+# Revert to the default (FullyAutomated)
+Remove-HvDRSVMAutomationLevel -ClusterName 'PROD-CLUSTER' -VMName 'SQL-PROD-01'
+```
+
+The override store is shared between `Invoke-HvDRS` and `Invoke-HvStorageDRS` — automation level is a per-VM setting, not a compute-vs-storage one, matching vSphere.
+
+---
+
+## What-If Capacity Forecasting
+
+`Get-HvDRSCapacityForecast` is read-only — it never migrates or moves anything — and answers two "what if" questions:
+
+```powershell
+# Can HV-NODE3 be safely drained for hardware maintenance right now?
+Get-HvDRSCapacityForecast -ClusterName 'PROD-CLUSTER' -RemoveNode 'HV-NODE3'
+
+# Would a new 64-core / 256 GB node meaningfully help the cluster?
+Get-HvDRSCapacityForecast -ClusterName 'PROD-CLUSTER' -AddNode 'HV-NODE9' -AddNodeCpuCores 64 -AddNodeMemoryMB 262144
+```
+
+`-RemoveNode` runs every VM currently on that node through the same destination-selection logic `Enter-HvDRSNodeMaintenance` uses and reports each VM's projected happiness plus whether it could be placed at all (`Feasible` on the returned object). `-AddNode` checks which of the cluster's currently-unhappy VMs a hypothetical new node (with the CPU/memory/network specs you specify) could absorb, and by how much — deliberately ignoring the real cluster's possible-owner configuration, since the whole point is evaluating a node before you've set that up.
+
+---
+
+## Webhook / Event Log Notifications
+
+Both `Invoke-HvDRS` and `Invoke-HvStorageDRS` can notify an external system when a pass completes:
+
+```powershell
+# POST a JSON summary to a webhook (e.g. a Teams/Slack incoming webhook, or your own endpoint)
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -WebhookUrl 'https://example.org/hvdrs-hook'
+
+# Write the same summary to the Windows Application event log (source: HVDRS)
+Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -WriteEventLog
+
+# Both at once
+Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -WebhookUrl 'https://example.org/hvdrs-hook' -WriteEventLog
+```
+
+The payload carries `ClusterName`, `GeneratedAt`, `Mode`, `RecommendationCount`, `ExecutedCount`, `FailedCount`, and `ViolationCount`. A failed webhook POST or event log write is logged with `Write-Warning` and never fails the pass itself — notifications are best-effort.
 
 ---
 

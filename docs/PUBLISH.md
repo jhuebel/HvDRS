@@ -100,8 +100,8 @@ The script will:
 3. Run the Pester test suite (unless `-SkipTests` is passed).
 4. Copy the module files to a temporary staging directory, excluding:
    - `Publish\` — this directory (scripts and config)
-   - `Tests\` — the test suite
-   - `PUBLISH.md` — this document
+   - `Tests\`, `ProPack\` — the test suites (compute and ProPack)
+   - `docs\PUBLISH.md` — this document (removed from the staged copy after `docs\` is copied)
    - `.gitignore`, `.gitattributes`
 5. Call `Publish-Module` against the staging directory.
 6. Clean up the staging directory.
@@ -133,11 +133,11 @@ The staging step includes everything in the repository **except**:
 | Excluded path | Reason |
 |---|---|
 | `Publish\` | Publish scripts and credentials — not part of the module |
-| `Tests\` | Pester test suite — not needed by end users |
-| `PUBLISH.md` | Developer documentation — not relevant to module consumers |
+| `Tests\`, `ProPack\` | Pester test suites — not needed by end users (`ProPack\` is also an optional, separately-installed add-on) |
+| `docs\PUBLISH.md` | Developer documentation — not relevant to module consumers |
 | `.gitignore` | Source control artifact |
 
-Everything else ships with the package: `HVDRS.psd1`, `HVDRS.psm1`, `Functions\`, `README.md`, `INSTALL.md`, `USAGE.md`, `TESTS.md`, `LICENSE`.
+Everything else ships with the package: `HVDRS.psd1`, `HVDRS.psm1`, `Functions\`, `README.md`, `LICENSE`, and the rest of `docs\` (`INSTALL.md`, `USAGE.md`, `TESTS.md`, `ARCHITECTURE.md`).
 
 ---
 

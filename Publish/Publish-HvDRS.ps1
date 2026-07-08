@@ -60,7 +60,7 @@ Write-Step 'Loading publish config...'
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Fail ("Config file not found: $ConfigPath`n" +
         "Copy Publish\publish.config.template.json to Publish\publish.config.json " +
-        "and fill in your API key. See PUBLISH.md for details.")
+        "and fill in your API key. See docs\PUBLISH.md for details.")
 }
 
 $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
@@ -123,7 +123,13 @@ Write-Step 'Staging module files...'
 
 # Directories and files at the repo root that must NOT be included in the published module
 $excludeDirs  = @('Publish', 'Tests', 'ProPack', '.git', '.claude')
-$excludeFiles = @('PUBLISH.md', '.gitignore', '.gitattributes')
+$excludeFiles = @('.gitignore', '.gitattributes')
+
+# docs\PUBLISH.md is developer-only documentation, not relevant to module consumers.
+# It lives under docs\ (which otherwise ships in full, alongside INSTALL.md/USAGE.md/
+# TESTS.md/ARCHITECTURE.md) so it can't be filtered by the top-level excludes above —
+# it's removed from the staged copy explicitly after copying.
+$stagedDocsPublish = 'docs\PUBLISH.md'
 
 $stageRoot  = Join-Path ([System.IO.Path]::GetTempPath()) "HvDRS-publish-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
 $stageModule = Join-Path $stageRoot $moduleName
@@ -147,6 +153,11 @@ foreach ($item in $items) {
             Copy-Item -LiteralPath $item.FullName -Destination $stageModule -Force
         }
     }
+}
+
+$stagedPublishMd = Join-Path $stageModule $stagedDocsPublish
+if ((Test-Path -LiteralPath $stagedPublishMd) -and $PSCmdlet.ShouldProcess($stagedPublishMd, 'Remove developer-only doc from staged package')) {
+    Remove-Item -LiteralPath $stagedPublishMd -Force
 }
 
 $stagedCount = if (Test-Path $stageModule) {

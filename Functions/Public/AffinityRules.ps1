@@ -31,16 +31,30 @@ function Add-HvDRSAffinityRule {
 
     .PARAMETER VMs
         VM names covered by this rule.
-        VmVmAffinity / VmVmAntiAffinity / VmVmCsvAffinity / VmVmCsvAntiAffinity require at least two VM names.
-        VmHostAffinity / VmHostAntiAffinity / VmCsvAffinity / VmCsvAntiAffinity require at least one VM name.
+        VmVmAffinity / VmVmAntiAffinity / VmVmCsvAffinity / VmVmCsvAntiAffinity require at least two VM names
+        (combined with -VMGroups membership — see below).
+        VmHostAffinity / VmHostAntiAffinity / VmCsvAffinity / VmCsvAntiAffinity require at least one VM name
+        (combined with -VMGroups membership).
 
     .PARAMETER Hosts
-        Required for VmHostAffinity and VmHostAntiAffinity.
+        Required for VmHostAffinity and VmHostAntiAffinity (combined with -HostGroups membership).
         Node names of the hosts involved in the rule.
 
     .PARAMETER CSVs
-        Required for VmCsvAffinity and VmCsvAntiAffinity.
+        Required for VmCsvAffinity and VmCsvAntiAffinity (combined with -CSVGroups membership).
         Cluster Shared Volume names involved in the rule (see Get-StorageSnapshot / Get-ClusterSharedVolume).
+
+    .PARAMETER VMGroups
+        Names of reusable VM groups (see Add-HvDRSGroup -Type Vm) whose current members are
+        unioned with -VMs every time the rule is loaded. Membership is resolved dynamically —
+        editing the group with Set-HvDRSGroup takes effect immediately, with no need to
+        re-save this rule.
+
+    .PARAMETER HostGroups
+        Names of reusable host groups (Add-HvDRSGroup -Type Host) unioned with -Hosts at load time.
+
+    .PARAMETER CSVGroups
+        Names of reusable CSV groups (Add-HvDRSGroup -Type Csv) unioned with -CSVs at load time.
 
     .PARAMETER Enforced
         Hard rule: HvDRS will never execute a migration that would break this rule, and will
@@ -85,6 +99,9 @@ function Add-HvDRSAffinityRule {
         [Parameter(Mandatory)] [string[]] $VMs,
         [string[]] $Hosts       = @(),
         [string[]] $CSVs        = @(),
+        [string[]] $VMGroups    = @(),
+        [string[]] $HostGroups  = @(),
+        [string[]] $CSVGroups   = @(),
         [switch]   $Enforced,
         [string]   $Description = '',
         [string]   $RulesPath   = $script:HvDRSDefaultRulesPath
@@ -95,21 +112,24 @@ function Add-HvDRSAffinityRule {
         catch { throw "No -ClusterName specified and no local cluster detected. $_" }
     }
 
-    # Validate minimum membership
-    if ($Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and $VMs.Count -lt 2) {
-        throw "$Type rules require at least two VM names."
+    # Validate minimum membership. Group-sourced members aren't resolved until
+    # load time (Get-AffinityRuleSet), so this only guards against an obviously
+    # under-specified rule (e.g. neither -VMs nor -VMGroups given) rather than the
+    # true post-expansion count.
+    if ($Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and ($VMs.Count + $VMGroups.Count) -lt 2) {
+        throw "$Type rules require at least two VM names (via -VMs and/or -VMGroups)."
     }
-    if ($Type -in @('VmHostAffinity','VmHostAntiAffinity') -and $Hosts.Count -eq 0) {
-        throw "$Type rules require at least one host name via -Hosts."
+    if ($Type -in @('VmHostAffinity','VmHostAntiAffinity') -and ($Hosts.Count + $HostGroups.Count) -eq 0) {
+        throw "$Type rules require at least one host name via -Hosts and/or -HostGroups."
     }
-    if ($Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and $CSVs.Count -eq 0) {
-        throw "$Type rules require at least one CSV name via -CSVs."
+    if ($Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and ($CSVs.Count + $CSVGroups.Count) -eq 0) {
+        throw "$Type rules require at least one CSV name via -CSVs and/or -CSVGroups."
     }
 
     if (-not $PSCmdlet.ShouldProcess($Name, "Add HvDRS $Type rule for cluster '$ClusterName'")) { return }
 
     # Load ALL rules (unfiltered) so we can save the full set back
-    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath)
+    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath -SkipGroupExpansion)
 
     # Duplicate check is scoped to the same cluster
     if ($rules | Where-Object { $_.ClusterName -eq $ClusterName -and $_.Name -eq $Name }) {
@@ -126,6 +146,9 @@ function Add-HvDRSAffinityRule {
         VMs         = @($VMs)
         Hosts       = @($Hosts)
         CSVs        = @($CSVs)
+        VMGroups    = @($VMGroups)
+        HostGroups  = @($HostGroups)
+        CSVGroups   = @($CSVGroups)
         Description = $Description
         CreatedAt   = (Get-Date -Format 'o')
     }
@@ -209,7 +232,7 @@ function Remove-HvDRSAffinityRule {
     )
 
     # Load ALL rules unfiltered — we need the full set to save back correctly
-    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath)
+    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath -SkipGroupExpansion)
 
     $target = if ($PSCmdlet.ParameterSetName -eq 'ById') {
         $rules | Where-Object { $_.RuleId -eq $RuleId }
@@ -268,6 +291,15 @@ function Set-HvDRSAffinityRule {
     .PARAMETER RemoveCSVs
         Remove CSV names from the rule's CSV list.
 
+    .PARAMETER AddVMGroups / RemoveVMGroups
+        Add/remove VM group names (see Add-HvDRSGroup -Type Vm) from the rule.
+
+    .PARAMETER AddHostGroups / RemoveHostGroups
+        Add/remove host group names (Add-HvDRSGroup -Type Host) from the rule.
+
+    .PARAMETER AddCSVGroups / RemoveCSVGroups
+        Add/remove CSV group names (Add-HvDRSGroup -Type Csv) from the rule.
+
     .PARAMETER Description
         Replace the rule's description text.
     #>
@@ -276,22 +308,38 @@ function Set-HvDRSAffinityRule {
         [Parameter(Mandatory)] [string]   $RuleId,
         [string]   $NewName,
         [nullable[bool]] $Enforced,
-        [string[]] $AddVMs      = @(),
-        [string[]] $RemoveVMs   = @(),
-        [string[]] $AddHosts    = @(),
-        [string[]] $RemoveHosts = @(),
-        [string[]] $AddCSVs     = @(),
-        [string[]] $RemoveCSVs  = @(),
+        [string[]] $AddVMs         = @(),
+        [string[]] $RemoveVMs      = @(),
+        [string[]] $AddHosts       = @(),
+        [string[]] $RemoveHosts    = @(),
+        [string[]] $AddCSVs        = @(),
+        [string[]] $RemoveCSVs     = @(),
+        [string[]] $AddVMGroups    = @(),
+        [string[]] $RemoveVMGroups = @(),
+        [string[]] $AddHostGroups    = @(),
+        [string[]] $RemoveHostGroups = @(),
+        [string[]] $AddCSVGroups     = @(),
+        [string[]] $RemoveCSVGroups  = @(),
         [string]   $Description,
         [string]   $RulesPath   = $script:HvDRSDefaultRulesPath
     )
 
-    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath)
+    $rules = [System.Collections.Generic.List[PSCustomObject]](Get-AffinityRuleSet -Path $RulesPath -SkipGroupExpansion)
     $rule  = $rules | Where-Object { $_.RuleId -eq $RuleId }
 
     if (-not $rule) {
         Write-Warning "No rule found with ID '$RuleId'."
         return
+    }
+
+    # Rules persisted before groups existed won't have these properties — add
+    # them (defaulted to empty) before any read/write below, since even
+    # *assigning* to a genuinely nonexistent property throws under Set-StrictMode
+    # (only Add-Member can introduce a new property safely).
+    foreach ($groupProp in 'VMGroups', 'HostGroups', 'CSVGroups') {
+        if (-not $rule.PSObject.Properties[$groupProp]) {
+            $rule | Add-Member -NotePropertyName $groupProp -NotePropertyValue @() -Force
+        }
     }
 
     if (-not $PSCmdlet.ShouldProcess($rule.Name, 'Update HvDRS affinity rule')) { return }
@@ -318,13 +366,33 @@ function Set-HvDRSAffinityRule {
     if ($RemoveCSVs.Count -gt 0) {
         $rule.CSVs = @(@($rule.CSVs) | Where-Object { $RemoveCSVs -notcontains $_ })
     }
-
-    # Re-validate minimum membership after edits
-    if ($rule.Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and $rule.VMs.Count -lt 2) {
-        throw "Rule '$($rule.Name)' would have fewer than 2 VMs — $($rule.Type) requires at least 2."
+    if ($AddVMGroups.Count -gt 0) {
+        $rule.VMGroups = @(@($rule.VMGroups) + $AddVMGroups | Select-Object -Unique)
     }
-    if ($rule.Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and @($rule.CSVs).Count -eq 0) {
-        throw "Rule '$($rule.Name)' would have no CSVs — $($rule.Type) requires at least 1."
+    if ($RemoveVMGroups.Count -gt 0) {
+        $rule.VMGroups = @(@($rule.VMGroups) | Where-Object { $RemoveVMGroups -notcontains $_ })
+    }
+    if ($AddHostGroups.Count -gt 0) {
+        $rule.HostGroups = @(@($rule.HostGroups) + $AddHostGroups | Select-Object -Unique)
+    }
+    if ($RemoveHostGroups.Count -gt 0) {
+        $rule.HostGroups = @(@($rule.HostGroups) | Where-Object { $RemoveHostGroups -notcontains $_ })
+    }
+    if ($AddCSVGroups.Count -gt 0) {
+        $rule.CSVGroups = @(@($rule.CSVGroups) + $AddCSVGroups | Select-Object -Unique)
+    }
+    if ($RemoveCSVGroups.Count -gt 0) {
+        $rule.CSVGroups = @(@($rule.CSVGroups) | Where-Object { $RemoveCSVGroups -notcontains $_ })
+    }
+
+    # Re-validate minimum membership after edits (loosely — see Add-HvDRSAffinityRule)
+    if ($rule.Type -in @('VmVmAffinity','VmVmAntiAffinity','VmVmCsvAffinity','VmVmCsvAntiAffinity') -and
+        (@($rule.VMs).Count + @($rule.VMGroups).Count) -lt 2) {
+        throw "Rule '$($rule.Name)' would have fewer than 2 VMs — $($rule.Type) requires at least 2 (via VMs and/or VMGroups)."
+    }
+    if ($rule.Type -in @('VmCsvAffinity','VmCsvAntiAffinity') -and
+        (@($rule.CSVs).Count + @($rule.CSVGroups).Count) -eq 0) {
+        throw "Rule '$($rule.Name)' would have no CSVs — $($rule.Type) requires at least 1 (via CSVs and/or CSVGroups)."
     }
 
     Save-AffinityRuleSet -Rules $rules.ToArray() -Path $RulesPath

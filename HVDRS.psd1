@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.5.1'
+    ModuleVersion     = '1.6.0'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -15,12 +15,23 @@
         'Enable-HvDRSMaintenance',
         'Disable-HvDRSMaintenance',
         'Get-HvDRSMaintenanceStatus',
+        'Enter-HvDRSNodeMaintenance',
+        'Exit-HvDRSNodeMaintenance',
+        'Get-HvDRSNodeMaintenanceStatus',
         'Add-HvDRSAffinityRule',
         'Get-HvDRSAffinityRule',
         'Remove-HvDRSAffinityRule',
         'Set-HvDRSAffinityRule',
         'Test-HvDRSAffinityCompliance',
         'Test-HvDRSStorageAffinityCompliance',
+        'Add-HvDRSGroup',
+        'Get-HvDRSGroup',
+        'Remove-HvDRSGroup',
+        'Set-HvDRSGroup',
+        'Set-HvDRSVMAutomationLevel',
+        'Get-HvDRSVMAutomationLevel',
+        'Remove-HvDRSVMAutomationLevel',
+        'Get-HvDRSCapacityForecast',
         'Invoke-HvStorageDRS'
     )
     PrivateData       = @{
@@ -34,6 +45,46 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.6.0
+- Added -TrendWindow / -HistoryPath to Invoke-HvDRS: optional rolling-average
+  smoothing of node CPU/network utilization and VM CPU/memory-pressure across
+  consecutive passes, so a single transient spike doesn't trigger a migration.
+  Disabled by default (-TrendWindow 1) — zero behavior change unless opted in.
+- Added Enter-HvDRSNodeMaintenance / Exit-HvDRSNodeMaintenance /
+  Get-HvDRSNodeMaintenanceStatus: happiness-aware node evacuation (a Hyper-V
+  analog of vSphere's "Enter Maintenance Mode") that live-migrates every VM off
+  a node using the same Network-Aware/memory-reserve/affinity-rule destination
+  selection as Invoke-HvDRS, then pauses the node — or refuses to pause it if
+  any VM couldn't be placed.
+- Added VM/Host/CSV Groups (Add/Get/Remove/Set-HvDRSGroup) and new
+  -VMGroups/-HostGroups/-CSVGroups parameters on Add/Set-HvDRSAffinityRule:
+  reusable named groups that affinity rules can reference instead of listing
+  members directly. Group membership resolves dynamically at rule-load time —
+  editing a group takes effect immediately, with no rule re-save needed.
+- Added per-VM automation-level overrides (Set/Get/Remove-HvDRSVMAutomationLevel):
+  pin specific VMs to Manual so Invoke-HvDRS/Invoke-HvStorageDRS keep scoring
+  and recommending them but never execute a migration/move for them.
+- Added Get-HvDRSCapacityForecast: read-only what-if capacity analysis —
+  simulate draining a node (-RemoveNode) to check whether every VM on it has a
+  valid destination, or simulate adding a hypothetical node (-AddNode) to see
+  which currently-unhappy VMs it could absorb.
+- Added -WebhookUrl / -WriteEventLog to Invoke-HvDRS and Invoke-HvStorageDRS:
+  optional JSON webhook POST and/or Windows Application event log entry
+  summarizing each pass. A notification failure is logged as a warning and
+  never fails an otherwise-successful pass.
+- Added -PassThru to Invoke-HvStorageDRS (previously compute-only), and
+  extended the optional ProPack VMM PRO Tips integration to cover storage DRS
+  recommendations (ConvertTo-HvDrsStorageProTip, Resolve-VmmStorageIdentity,
+  Invoke-HvDrsStorageProTipProbe, and a parallel monitor/rule pair in the
+  Management Pack) — previously compute-only.
+- Fixed a latent bug in Invoke-HvStorageDRS where its Format-Table calls were
+  never piped to Out-Host, so capturing its return value (now needed by
+  -PassThru) leaked PowerShell formatting objects onto the output stream. Same
+  class of bug already fixed for Invoke-HvDRS in 1.5.0.
+- Moved all documentation except README.md into a new docs/ folder
+  (docs/INSTALL.md, docs/USAGE.md, docs/TESTS.md, docs/PUBLISH.md) and added
+  docs/ARCHITECTURE.md, a new technical design reference.
+
 ## 1.5.1
 - Fixed three latent bugs where a zero-match result collapsed to $null instead
   of an empty array/collection at a function or switch-expression output

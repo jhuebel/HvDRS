@@ -158,3 +158,38 @@ function New-StorageSnapshot {
         VMs         = $VMs
     }
 }
+
+function New-StorageMigrationRecommendation {
+    param(
+        [string] $ClusterName        = 'TEST-CLUSTER',
+        [object] $GeneratedAt        = (Get-Date),
+        [string] $VMName             = 'VM01',
+        [string] $VMId               = [System.Guid]::NewGuid().ToString(),
+        [string] $HostNode           = 'HOST-A',
+        [string] $SourceCSVName      = 'Volume1',
+        [string] $DestinationCSVName = 'Volume2',
+        [float]  $TotalVhdGB         = 50.0,
+        [float]  $SourceScoreBefore  = 20.0,
+        [float]  $SourceScoreAfter   = 80.0,
+        [float]  $DestScoreBefore    = 90.0,
+        [float]  $DestScoreAfter     = 85.0,
+        [float]  $Improvement        = 60.0,
+        [object] $ComplianceReason   = $null
+    )
+    [PSCustomObject]@{
+        ClusterName        = $ClusterName
+        GeneratedAt         = $GeneratedAt
+        VMName              = $VMName
+        VMId                = $VMId
+        HostNode            = $HostNode
+        SourceCSVName       = $SourceCSVName
+        DestinationCSVName  = $DestinationCSVName
+        TotalVhdGB          = $TotalVhdGB
+        SourceScoreBefore   = $SourceScoreBefore
+        SourceScoreAfter    = $SourceScoreAfter
+        DestScoreBefore     = $DestScoreBefore
+        DestScoreAfter      = $DestScoreAfter
+        Improvement         = $Improvement
+        ComplianceReason    = $ComplianceReason
+    }
+}

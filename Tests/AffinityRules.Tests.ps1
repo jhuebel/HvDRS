@@ -17,18 +17,24 @@ Describe 'AffinityRules' {
 
 BeforeAll {
     . "$PSScriptRoot/../Functions/Private/Get-HvDRSDataRoot.ps1"
+    . "$PSScriptRoot/../Functions/Private/Get-HvDRSGroupSet.ps1"
     . "$PSScriptRoot/../Functions/Private/Get-AffinityRuleSet.ps1"
     . "$PSScriptRoot/../Functions/Public/AffinityRules.ps1"
+    . "$PSScriptRoot/../Functions/Public/Groups.ps1"
 }
 
 # Each test gets its own temp file path via BeforeEach / AfterEach
 BeforeEach {
-    $testRulesPath = [System.IO.Path]::GetTempFileName() + '.json'
+    $testRulesPath  = [System.IO.Path]::GetTempFileName() + '.json'
+    $testGroupsPath = [System.IO.Path]::GetTempFileName() + '.json'
 }
 
 AfterEach {
     if (Test-Path -LiteralPath $testRulesPath) {
         Remove-Item -LiteralPath $testRulesPath -Force
+    }
+    if (Test-Path -LiteralPath $testGroupsPath) {
+        Remove-Item -LiteralPath $testGroupsPath -Force
     }
 }
 
@@ -413,6 +419,85 @@ Describe 'Per-cluster scoping' {
         $prodRules = Get-AffinityRuleSet -ClusterName 'PROD' -Path $testRulesPath
         $prodRules.Count             | Should -Be 1
         $prodRules[0].ClusterName    | Should -Be 'PROD'
+    }
+}
+
+Describe 'Group expansion in Get-AffinityRuleSet' {
+
+    It 'unions a VM group''s members into a rule''s VMs at read time' {
+        Add-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'SQL VMs' -Type Vm -Members @('SQL1','SQL2') -GroupsPath $testGroupsPath
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAntiAffinity' `
+                              -VMs @('DC1') -VMGroups @('SQL VMs') -RulesPath $testRulesPath
+
+        $rule = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        $rule[0].VMs | Should -Contain 'DC1'
+        $rule[0].VMs | Should -Contain 'SQL1'
+        $rule[0].VMs | Should -Contain 'SQL2'
+    }
+
+    It 'reflects a group membership change immediately, with no rule re-save' {
+        Add-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'WebVMs' -Type Vm -Members @('WEB1') -GroupsPath $testGroupsPath
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAffinity' `
+                              -VMs @('LB1') -VMGroups @('WebVMs') -RulesPath $testRulesPath
+
+        $before = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        $before[0].VMs.Count | Should -Be 2
+
+        $group = Get-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'WebVMs' -GroupsPath $testGroupsPath
+        Set-HvDRSGroup -GroupId $group.GroupId -AddMembers @('WEB2') -GroupsPath $testGroupsPath
+
+        $after = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        $after[0].VMs.Count | Should -Be 3
+        $after[0].VMs | Should -Contain 'WEB2'
+    }
+
+    It 'expands host groups into a VmHostAffinity rule''s Hosts' {
+        Add-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'Rack A' -Type Host -Members @('NODE1','NODE2') -GroupsPath $testGroupsPath
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmHostAffinity' `
+                              -VMs @('VM1') -HostGroups @('Rack A') -RulesPath $testRulesPath
+
+        $rule = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        $rule[0].Hosts | Should -Contain 'NODE1'
+        $rule[0].Hosts | Should -Contain 'NODE2'
+    }
+
+    It 'expands CSV groups into a VmCsvAffinity rule''s CSVs' {
+        Add-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'Tier1' -Type Csv -Members @('Volume1','Volume2') -GroupsPath $testGroupsPath
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmCsvAffinity' `
+                              -VMs @('VM1') -CSVGroups @('Tier1') -RulesPath $testRulesPath
+
+        $rule = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        $rule[0].CSVs | Should -Contain 'Volume1'
+        $rule[0].CSVs | Should -Contain 'Volume2'
+    }
+
+    It 'does not persist expanded group members back into the rule store on a subsequent edit' {
+        Add-HvDRSGroup -ClusterName 'CLUSTER1' -Name 'SQL VMs' -Type Vm -Members @('SQL1','SQL2') -GroupsPath $testGroupsPath
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAntiAffinity' `
+                              -VMs @('DC1') -VMGroups @('SQL VMs') -RulesPath $testRulesPath
+
+        # Trigger a resave via Set-HvDRSAffinityRule (loads raw, unexpanded rules internally)
+        $rule = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath $testGroupsPath
+        Set-HvDRSAffinityRule -RuleId $rule[0].RuleId -Description 'updated' -RulesPath $testRulesPath
+
+        # Raw (unexpanded) rule on disk must still show only the literal VM, not the group's members
+        $raw = Get-Content -LiteralPath $testRulesPath -Raw | ConvertFrom-Json
+        @($raw.Rules[0].VMs) | Should -Be @('DC1')
+    }
+
+    It 'works when groups.json does not exist (no groups defined)' {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAffinity' `
+                              -VMs @('VM1','VM2') -RulesPath $testRulesPath
+
+        $rule = Get-AffinityRuleSet -ClusterName 'CLUSTER1' -Path $testRulesPath -GroupsPath 'TestDrive:\does-not-exist.json'
+        $rule[0].VMs | Should -Be @('VM1','VM2')
+    }
+
+    It 'validates minimum VM membership counting VMGroups alongside VMs' {
+        { Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAffinity' `
+                                -VMs @('VM1') -RulesPath $testRulesPath } | Should -Throw
+        { Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R2' -Type 'VmVmAffinity' `
+                                -VMs @('VM1') -VMGroups @('SomeGroup') -RulesPath $testRulesPath } | Should -Not -Throw
     }
 }
 

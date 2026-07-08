@@ -70,6 +70,33 @@ function Invoke-HvStorageDRS {
         suppresses both compute and storage migrations.
         Default: $env:ProgramData\HvDRS\maintenance.lock
 
+    .PARAMETER AutomationOverridesPath
+        Path to the JSON per-VM automation-level override store (see
+        Set-HvDRSVMAutomationLevel) — shared with Invoke-HvDRS, since automation
+        level is a per-VM setting, not a compute-vs-storage one. A VM pinned to
+        Manual still gets a storage recommendation but is never actually moved by
+        this function. Default: $env:ProgramData\HvDRS\automation-overrides.json.
+
+    .PARAMETER WebhookUrl
+        If specified, POSTs a JSON summary of the pass (cluster, mode, recommendation/
+        execution counts, violation count) to this URL when the pass completes. A
+        failed POST is logged with Write-Warning and never fails the pass itself.
+
+    .PARAMETER WriteEventLog
+        If specified, writes the same JSON summary to the Windows Application event
+        log under source 'HVDRS' (creating the source if needed) when the pass completes.
+
+    .PARAMETER PassThru
+        Emit the storage migration recommendations to the pipeline as structured
+        objects, in addition to the normal console output. Each object carries
+        ClusterName, GeneratedAt, VMName, VMId, HostNode, SourceCSVName,
+        DestinationCSVName, TotalVhdGB, SourceScoreBefore/After, DestScoreBefore/After,
+        Improvement, and ComplianceReason — the same shape Invoke-HvDRS's -PassThru
+        uses for compute recommendations, adapted for storage. Has no effect on
+        migration execution behavior — combine with -RecommendOnly for a read-only,
+        object-returning pass. This is what the storage ProPack probe consumes
+        (see ProPack/Scripts/Invoke-HvDrsStorageProTipProbe.ps1).
+
     .EXAMPLE
         # Dry run — print recommendations without moving data
         Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -WhatIf
@@ -110,7 +137,15 @@ function Invoke-HvStorageDRS {
 
         [switch] $RecommendOnly,
 
-        [string] $MaintenanceLockFile  = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock')
+        [string] $MaintenanceLockFile  = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock'),
+
+        [string] $AutomationOverridesPath = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\automation-overrides.json'),
+
+        [string] $WebhookUrl,
+
+        [switch] $WriteEventLog,
+
+        [switch] $PassThru
     )
 
     # ── Resolve cluster ────────────────────────────────────────────────────────
@@ -135,6 +170,12 @@ function Invoke-HvStorageDRS {
     $ruleSet   = @(Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName |
                   Where-Object { $_.Type -in $storageRuleTypes })
     $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
+
+    # ── Load per-VM automation-level overrides ─────────────────────────────────
+    $manualVMs = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($override in (Get-HvDRSAutomationOverrideSet -Path $AutomationOverridesPath -ClusterName $ClusterName)) {
+        if ($override.AutomationLevel -eq 'Manual') { [void]$manualVMs.Add($override.VMName) }
+    }
 
     Write-Host ("{0} HvStorageDRS starting — Cluster: {1}  Aggression: {2}  Weights: Space={3} IO={4}  Reserve: {5} GB  Rules: {6}  Mode: {7}" -f
         (& $ts), $ClusterName, $AggressionLevel, $SpaceWeight, $IoWeight, $MinFreeGBReserve, $ruleLabel, $modeLabel)
@@ -163,8 +204,10 @@ function Invoke-HvStorageDRS {
         (& $ts), $snapshot.CSVs.Count, $snapshot.VMs.Count)
 
     # ── Phase 1.5: Check storage affinity rule compliance ─────────────────────
+    $violationCount = 0
     if ($ruleSet.Count -gt 0) {
         $storageViolations = @(Test-StorageAffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet)
+        $violationCount    = $storageViolations.Count
 
         if ($storageViolations.Count -gt 0) {
             $hardCount = @($storageViolations | Where-Object { $_.Enforced }).Count
@@ -178,10 +221,25 @@ function Invoke-HvStorageDRS {
                 @{ N='Type';     E={ $_.Type } },
                 @{ N='Hard';     E={ $_.Enforced } },
                 @{ N='VMs';      E={ $_.VMs -join ', ' } },
-                @{ N='Detail';   E={ $_.Description } }
+                @{ N='Detail';   E={ $_.Description } } | Out-Host
         } else {
             Write-Host ("{0} All {1} storage affinity rule(s) satisfied." -f (& $ts), $ruleSet.Count)
         }
+    }
+
+    $notify = {
+        param($RecommendationCount, $ExecutedCount, $FailedCount)
+        if (-not $WebhookUrl -and -not $WriteEventLog) { return }
+        $payload = [PSCustomObject]@{
+            ClusterName         = $ClusterName
+            GeneratedAt         = [DateTime]::Now
+            Mode                = $modeLabel
+            RecommendationCount = $RecommendationCount
+            ExecutedCount       = $ExecutedCount
+            FailedCount         = $FailedCount
+            ViolationCount      = $violationCount
+        }
+        Send-HvDRSNotification -Payload $payload -WebhookUrl $WebhookUrl -WriteEventLog:$WriteEventLog
     }
 
     # ── Phase 2: CSV space + I/O summary ──────────────────────────────────────
@@ -196,7 +254,7 @@ function Invoke-HvStorageDRS {
         @{ N='Used %';      E={ '{0:N1}' -f $_.SpaceUsedPct } },
         @{ N='Read IOPS';   E={ if ($null -ne $_.ReadIOPS)  { '{0:N0}' -f $_.ReadIOPS  } else { 'N/A' } } },
         @{ N='Write IOPS';  E={ if ($null -ne $_.WriteIOPS) { '{0:N0}' -f $_.WriteIOPS } else { 'N/A' } } },
-        @{ N='Latency ms';  E={ if ($null -ne $_.LatencyMs) { '{0:N2}' -f $_.LatencyMs } else { 'N/A' } } }
+        @{ N='Latency ms';  E={ if ($null -ne $_.LatencyMs) { '{0:N2}' -f $_.LatencyMs } else { 'N/A' } } } | Out-Host
 
     # ── Phase 3: Score all CSVs ────────────────────────────────────────────────
     $csvScores = foreach ($csv in $snapshot.CSVs) {
@@ -213,7 +271,7 @@ function Invoke-HvStorageDRS {
             if    ($_.HappinessScore -ge 80) { 'Healthy' }
             elseif ($_.HappinessScore -ge 50) { 'Pressured' }
             else                             { 'CRITICAL' }
-        }}
+        }} | Out-Host
 
     # ── Phase 4: Find storage migration candidates ─────────────────────────────
     $migrations = Find-StorageMigrationCandidates `
@@ -227,9 +285,31 @@ function Invoke-HvStorageDRS {
                       -RuleComplianceBonus $RuleComplianceBonus `
                       -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
+    $generatedAt     = [DateTime]::Now
+    $passThruResults = foreach ($m in $migrations) {
+        [PSCustomObject]@{
+            ClusterName        = $ClusterName
+            GeneratedAt        = $generatedAt
+            VMName             = $m.VMName
+            VMId               = $m.VMId
+            HostNode           = $m.HostNode
+            SourceCSVName      = $m.SourceCSVName
+            DestinationCSVName = $m.DestinationCSVName
+            TotalVhdGB         = $m.TotalVhdGB
+            SourceScoreBefore  = $m.SourceScoreBefore
+            SourceScoreAfter   = $m.SourceScoreAfter
+            DestScoreBefore    = $m.DestScoreBefore
+            DestScoreAfter     = $m.DestScoreAfter
+            Improvement        = $m.Improvement
+            ComplianceReason   = $m.ComplianceReason
+        }
+    }
+
     if (-not $migrations -or $migrations.Count -eq 0) {
         Write-Host ("{0} Storage is balanced at aggression level {1}. No migrations needed." -f
             (& $ts), $AggressionLevel)
+        & $notify 0 0 0
+        if ($PassThru) { Write-Output $passThruResults }
         return
     }
 
@@ -249,7 +329,7 @@ function Invoke-HvStorageDRS {
             if ($_.ComplianceReason) {
                 'Compliance: ' + ($_.ComplianceReason.Substring(0, [Math]::Min(40, $_.ComplianceReason.Length)))
             } else { 'Happiness' }
-        }}
+        }} | Out-Host
 
     # ── Phase 5: Execute or preview ────────────────────────────────────────────
     if (-not $willMigrate) {
@@ -258,13 +338,23 @@ function Invoke-HvStorageDRS {
         Write-Host ''
         Write-Host ("{0} HvStorageDRS pass complete — {1} recommendation(s), no migrations executed." -f
             (& $ts), $migrations.Count)
+        & $notify $migrations.Count 0 0
+        if ($PassThru) { Write-Output $passThruResults }
         return
     }
 
     $succeeded = 0
     $failed    = 0
+    $pinned    = 0
 
     foreach ($migration in $migrations) {
+        if ($manualVMs.Contains($migration.VMName)) {
+            Write-Host ("{0} Skipping '{1}' — pinned to Manual automation (see Set-HvDRSVMAutomationLevel). Recommendation stands; not executed." -f
+                (& $ts), $migration.VMName) -ForegroundColor Yellow
+            $pinned++
+            continue
+        }
+
         $action = "Storage live-migrate '{0}' ({1:N1} GB VHDs) from '{2}' to '{3}'" -f
                   $migration.VMName, $migration.TotalVhdGB,
                   $migration.SourceCSVName, $migration.DestinationCSVName
@@ -292,7 +382,11 @@ function Invoke-HvStorageDRS {
 
     if ($PSCmdlet.ShouldProcess('summary', 'Report')) {
         Write-Host ''
-        Write-Host ("{0} HvStorageDRS pass complete — {1} migrated, {2} failed." -f
-            (& $ts), $succeeded, $failed)
+        Write-Host ("{0} HvStorageDRS pass complete — {1} migrated, {2} failed, {3} pinned to Manual (not executed)." -f
+            (& $ts), $succeeded, $failed, $pinned)
     }
+
+    & $notify $migrations.Count $succeeded $failed
+
+    if ($PassThru) { Write-Output $passThruResults }
 }

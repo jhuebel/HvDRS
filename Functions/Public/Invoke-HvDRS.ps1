@@ -41,6 +41,19 @@ function Invoke-HvDRS {
     .PARAMETER SampleIntervalSeconds
         Seconds between CPU counter samples (default: 2).
 
+    .PARAMETER TrendWindow
+        Number of consecutive Invoke-HvDRS passes (including this one) to average a
+        node's CPU/network utilization and a VM's CPU/memory-pressure over before
+        scoring, so a single transient spike doesn't trigger a migration (1-10,
+        default: 1 = disabled — scoring uses this pass's snapshot only, identical to
+        prior behavior). Values above 1 persist a rolling history file at
+        -HistoryPath between calls; capacity fields (free memory, LP count) are
+        never smoothed, since they reflect current headroom, not a multi-pass trend.
+
+    .PARAMETER HistoryPath
+        Path to the JSON trend-history file used when -TrendWindow is greater than 1.
+        Default: $env:ProgramData\HvDRS\history\<ClusterName>.json.
+
     .PARAMETER CpuWeight
         Relative weight of CPU happiness in the combined score (default: 0.5).
 
@@ -80,6 +93,22 @@ function Invoke-HvDRS {
         any workloads. Default: $env:ProgramData\HvDRS\maintenance.lock
 
         Use Enable-HvDRSMaintenance / Disable-HvDRSMaintenance to manage the lock file.
+
+    .PARAMETER AutomationOverridesPath
+        Path to the JSON per-VM automation-level override store (see
+        Set-HvDRSVMAutomationLevel). A VM pinned to Manual still gets scored and
+        appears in the recommendation output, but is never actually migrated by
+        this function — the same distinction vSphere DRS makes between per-VM
+        automation levels. Default: $env:ProgramData\HvDRS\automation-overrides.json.
+
+    .PARAMETER WebhookUrl
+        If specified, POSTs a JSON summary of the pass (cluster, mode, recommendation/
+        execution counts, violation count) to this URL when the pass completes. A
+        failed POST is logged with Write-Warning and never fails the pass itself.
+
+    .PARAMETER WriteEventLog
+        If specified, writes the same JSON summary to the Windows Application event
+        log under source 'HVDRS' (creating the source if needed) when the pass completes.
 
     .PARAMETER PassThru
         Emit the migration recommendations to the pipeline as structured objects, in addition
@@ -123,6 +152,11 @@ function Invoke-HvDRS {
 
         [int]$SampleIntervalSeconds = 2,
 
+        [ValidateRange(1, 10)]
+        [int]$TrendWindow = 1,
+
+        [string]$HistoryPath,
+
         [ValidateRange(0.0, 1.0)]
         [float]$CpuWeight = 0.5,
 
@@ -146,6 +180,12 @@ function Invoke-HvDRS {
 
         [string]$MaintenanceLockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock'),
 
+        [string]$AutomationOverridesPath = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\automation-overrides.json'),
+
+        [string]$WebhookUrl,
+
+        [switch]$WriteEventLog,
+
         [switch]$PassThru
     )
 
@@ -156,6 +196,11 @@ function Invoke-HvDRS {
         } catch {
             throw "No -ClusterName specified and no local cluster detected. $_"
         }
+    }
+
+    if (-not $HistoryPath) {
+        $safeClusterName = ($ClusterName -replace '[\\/:*?"<>|]', '_')
+        $HistoryPath = Join-Path (Get-HvDRSDataRoot) "HvDRS\history\$safeClusterName.json"
     }
 
     $ts = { "[{0}]" -f [DateTime]::Now.ToString('HH:mm:ss') }
@@ -177,6 +222,12 @@ function Invoke-HvDRS {
     $ruleSet   = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
     $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
 
+    # ── Load per-VM automation-level overrides ─────────────────────────────────
+    $manualVMs = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($override in (Get-HvDRSAutomationOverrideSet -Path $AutomationOverridesPath -ClusterName $ClusterName)) {
+        if ($override.AutomationLevel -eq 'Manual') { [void]$manualVMs.Add($override.VMName) }
+    }
+
     Write-Host ("{0} HvDRS starting — Cluster: {1}  Aggression: {2}  Network gate: {3}%  Rules: {4}  Mode: {5}" -f
         (& $ts), $ClusterName, $AggressionLevel, $MaxDestinationNetworkUtil, $ruleLabel, $modeLabel)
 
@@ -194,6 +245,11 @@ function Invoke-HvDRS {
                                     -SampleIntervalSeconds $SampleIntervalSeconds `
                                     -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
+    if ($TrendWindow -gt 1) {
+        Write-Host ("{0} Smoothing over a {1}-pass trend window ({2})..." -f (& $ts), $TrendWindow, $HistoryPath)
+        $snapshot = Merge-HvDRSTrendSnapshot -Snapshot $snapshot -HistoryPath $HistoryPath -WindowSize $TrendWindow
+    }
+
     Write-Host ("{0} Snapshot complete: {1} node(s), {2} running VM(s)" -f
         (& $ts), $snapshot.Nodes.Count, $snapshot.VMs.Count)
 
@@ -209,8 +265,10 @@ function Invoke-HvDRS {
         @{ N='VMs';      E={ $_.VMs.Count } } | Out-Host
 
     # ── Phase 2: Check affinity rule compliance ────────────────────────────────
+    $violationCount = 0
     if ($ruleSet.Count -gt 0) {
-        $violations = @(Test-AffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet)
+        $violations     = @(Test-AffinityCompliance -Snapshot $snapshot -RuleSet $ruleSet)
+        $violationCount = $violations.Count
 
         if ($violations.Count -gt 0) {
             $hardCount = @($violations | Where-Object { $_.Enforced }).Count
@@ -228,6 +286,21 @@ function Invoke-HvDRS {
         } else {
             Write-Host ("{0} All {1} affinity rule(s) satisfied." -f (& $ts), $ruleSet.Count)
         }
+    }
+
+    $notify = {
+        param($RecommendationCount, $ExecutedCount, $FailedCount)
+        if (-not $WebhookUrl -and -not $WriteEventLog) { return }
+        $payload = [PSCustomObject]@{
+            ClusterName         = $ClusterName
+            GeneratedAt         = [DateTime]::Now
+            Mode                = $modeLabel
+            RecommendationCount = $RecommendationCount
+            ExecutedCount       = $ExecutedCount
+            FailedCount         = $FailedCount
+            ViolationCount      = $violationCount
+        }
+        Send-HvDRSNotification -Payload $payload -WebhookUrl $WebhookUrl -WriteEventLog:$WriteEventLog
     }
 
     # ── Phase 3: Score all VMs ─────────────────────────────────────────────────
@@ -287,6 +360,7 @@ function Invoke-HvDRS {
     if (-not $migrations -or $migrations.Count -eq 0) {
         Write-Host ("{0} Cluster is balanced at aggression level {1}. No migrations needed." -f
             (& $ts), $AggressionLevel)
+        & $notify 0 0 0
         if ($PassThru) { Write-Output $passThruResults }
         return
     }
@@ -315,14 +389,23 @@ function Invoke-HvDRS {
         Write-Host ''
         Write-Host ("{0} HvDRS pass complete — {1} recommendation(s), no migrations executed." -f
             (& $ts), $migrations.Count)
+        & $notify $migrations.Count 0 0
         if ($PassThru) { Write-Output $passThruResults }
         return
     }
 
     $succeeded = 0
     $failed    = 0
+    $pinned    = 0
 
     foreach ($migration in $migrations) {
+        if ($manualVMs.Contains($migration.VMName)) {
+            Write-Host ("{0} Skipping '{1}' — pinned to Manual automation (see Set-HvDRSVMAutomationLevel). Recommendation stands; not executed." -f
+                (& $ts), $migration.VMName) -ForegroundColor Yellow
+            $pinned++
+            continue
+        }
+
         $trigger = if ($migration.ComplianceReason) { "rule compliance" } else { "happiness" }
         $action  = "Live-migrate '{0}' from '{1}' to '{2}' [{3}; score {4} → {5}]" -f
                    $migration.VMName, $migration.SourceNode, $migration.DestinationNode,
@@ -354,9 +437,11 @@ function Invoke-HvDRS {
 
     if ($PSCmdlet.ShouldProcess('summary', 'Report')) {
         Write-Host ''
-        Write-Host ("{0} HvDRS pass complete — {1} migrated, {2} failed." -f
-            (& $ts), $succeeded, $failed)
+        Write-Host ("{0} HvDRS pass complete — {1} migrated, {2} failed, {3} pinned to Manual (not executed)." -f
+            (& $ts), $succeeded, $failed, $pinned)
     }
+
+    & $notify $migrations.Count $succeeded $failed
 
     if ($PassThru) { Write-Output $passThruResults }
 }

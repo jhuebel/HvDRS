@@ -68,9 +68,20 @@ Tests/
 ├── Find-MigrationCandidates.Tests.ps1        # Compute migration planning logic
 ├── Get-MigrationRuleImpact.Tests.ps1         # Per-migration rule impact evaluation
 ├── Test-AffinityCompliance.Tests.ps1         # Current-placement violation detection
-├── AffinityRules.Tests.ps1                   # Affinity rule CRUD + per-cluster scoping
+├── AffinityRules.Tests.ps1                   # Affinity rule CRUD + per-cluster scoping + group expansion
 ├── Measure-CsvHappiness.Tests.ps1            # CSV happiness scoring algorithm
-└── Find-StorageMigrationCandidates.Tests.ps1 # Storage migration planning logic
+├── Find-StorageMigrationCandidates.Tests.ps1 # Storage migration planning logic
+├── Get-StorageMigrationRuleImpact.Tests.ps1  # Per-migration storage rule impact evaluation
+├── Test-StorageAffinityCompliance.Tests.ps1  # Current-placement storage violation detection
+├── Invoke-HvDRS.Tests.ps1                    # -PassThru, automation overrides, notifications control flow
+├── Invoke-HvStorageDRS.Tests.ps1             # -PassThru, automation overrides, notifications control flow
+├── Merge-HvDRSTrendSnapshot.Tests.ps1        # Rolling trend-window smoothing
+├── Find-EvacuationDestination.Tests.ps1      # Node-evacuation destination selection
+├── Maintenance.Tests.ps1                     # Enter/Exit/Get-HvDRSNodeMaintenance*
+├── Groups.Tests.ps1                          # VM/Host/CSV group CRUD + per-cluster scoping
+├── AutomationOverrides.Tests.ps1             # Per-VM automation-level override CRUD
+├── Get-HvDRSCapacityForecast.Tests.ps1       # What-if -RemoveNode / -AddNode forecasting
+└── Send-HvDRSNotification.Tests.ps1          # Webhook POST + event log notification
 ```
 
 ### `Tests/Helpers/New-TestObjects.ps1`
@@ -423,18 +434,89 @@ Verifies all fields on the returned migration object: `VMName`, `HostNode`, `Sou
 
 ---
 
+### `Invoke-HvDRS.Tests.ps1` — 11 tests
+
+Tests `Invoke-HvDRS`'s own control flow (mode resolution, `-PassThru` emission, automation-override gating, notification dispatch) with every collaborator (`Get-ClusterSnapshot`, `Find-MigrationCandidates`, `Get-HvDRSAutomationOverrideSet`, `Move-ClusterVirtualMachineRole`, `Send-HvDRSNotification`, etc.) stubbed and mocked — no real cluster, Hyper-V, or performance counters required.
+
+- `-PassThru` emits/suppresses structured recommendation objects correctly across `-RecommendOnly`, a balanced cluster, an active maintenance lock, and `-WhatIf`; `ComplianceReason` is preserved.
+- A VM pinned to `Manual` via the automation-override store is recommended but never migrated, while other VMs still execute; no override present migrates normally.
+- `Send-HvDRSNotification` is only called when `-WebhookUrl` or `-WriteEventLog` is set, with the correct `RecommendationCount`/`ExecutedCount`/`FailedCount` payload fields for both a balanced-cluster pass and a normal migration pass.
+
+### `Invoke-HvStorageDRS.Tests.ps1` — 9 tests
+
+Same shape as the compute test file above, adapted for storage: automation-override gating of `Move-VMStorage`, `-PassThru` emission/suppression, and `Send-HvDRSNotification` dispatch with storage-specific payload fields.
+
+### `Merge-HvDRSTrendSnapshot.Tests.ps1` — 8 tests
+
+Tests the rolling trend-window smoothing in `Functions/Private/Merge-HvDRSTrendSnapshot.ps1`.
+
+- Bootstraps a single-entry window when the history file is missing or corrupt (fail-soft, same pattern as `Get-AffinityRuleSet`).
+- Correctly averages node CPU/network utilization and VM CPU/memory-pressure across multiple recorded passes.
+- Trims history to `-WindowSize`, dropping the oldest entry once the window is full.
+- A VM present in only some prior entries is averaged over just those entries (no synthetic zero-fill).
+- Capacity fields (`TotalMemoryMB`, `AvailableMemoryMB`, `LogicalProcessorCount`) and identity fields (`ClusterName`, `HostNode`, `ProcessorCount`, `MemoryAssignedMB`) pass through unchanged rather than being averaged.
+
+### `Find-EvacuationDestination.Tests.ps1` — 10 tests
+
+Tests the shared node-evacuation destination selector in `Functions/Private/Find-EvacuationDestination.ps1`, used by both `Enter-HvDRSNodeMaintenance` and `Get-HvDRSCapacityForecast -RemoveNode`.
+
+- Picks the only valid candidate; excludes candidates above the Network-Aware gate, below the memory reserve, outside the cluster possible-owner list, or that would break an enforced affinity rule.
+- Treats all nodes as eligible when `Get-ClusterOwnerNode` throws.
+- Returns `$null` and mutates nothing when no valid destination exists.
+- Picks the destination with the highest projected happiness when multiple are valid.
+- Verifies the documented side effect: a successful call updates the chosen destination's simulated `CpuUtilization`/`AvailableMemoryMB` in place and sets the VM's `HostNode`, so two sequential calls in the same evacuation pass don't double-book one destination.
+
+### `Maintenance.Tests.ps1` — 9 tests
+
+Tests `Enter-HvDRSNodeMaintenance`, `Exit-HvDRSNodeMaintenance`, and `Get-HvDRSNodeMaintenanceStatus` in `Functions/Public/Maintenance.ps1`, with `Get-ClusterSnapshot`, `Find-EvacuationDestination`, `Move-ClusterVirtualMachineRole`, `Suspend-ClusterNode`, `Resume-ClusterNode`, and `Get-ClusterNode` all mocked.
+
+- An empty node evacuates trivially and gets paused; a node with a placeable VM migrates it and then pauses.
+- The node is **not** paused when a VM has no valid destination, and **not** paused when a migration call throws.
+- `-WhatIf` previews the full evacuation + pause plan without calling `Move-ClusterVirtualMachineRole` or `Suspend-ClusterNode`.
+- `Exit-HvDRSNodeMaintenance` calls `Resume-ClusterNode` (skipped under `-WhatIf`).
+- `Get-HvDRSNodeMaintenanceStatus` reports all nodes or filters to one via `-NodeName`.
+
+### `Groups.Tests.ps1` — 20 tests
+
+Tests the public group CRUD functions in `Functions/Public/Groups.ps1` (`Add/Get/Remove/Set-HvDRSGroup`), mirroring `AffinityRules.Tests.ps1`'s structure. Covers creation and duplicate-name warnings, per-cluster scoping (same group name in different clusters coexist independently), filtering by `-Type`/wildcard `-Name`, member add/remove without duplication, and `-WhatIf` non-persistence for every mutating cmdlet.
+
+### `AutomationOverrides.Tests.ps1` — 13 tests
+
+Tests `Set/Get/Remove-HvDRSVMAutomationLevel` in `Functions/Public/AutomationOverrides.ps1`. Covers upsert semantics (setting an existing VM's level updates rather than duplicates the entry), per-cluster scoping, filtering by `-VMName`, empty-array (not `$null`) results when nothing matches, and `-WhatIf` non-persistence.
+
+### `Get-HvDRSCapacityForecast.Tests.ps1` — 10 tests
+
+Tests the what-if capacity forecast in `Functions/Public/Get-HvDRSCapacityForecast.ps1`.
+
+**`-RemoveNode`** — throws for a nonexistent node; reports `Feasible = $true` when there are no VMs on the node or every VM finds a destination (via mocked `Find-EvacuationDestination`); reports `Feasible = $false` when a VM has none; excludes the removed node from the `NodeImpact` report.
+
+**`-AddNode`** — throws when the hypothetical node name collides with a real one; absorbs a genuinely unhappy VM (real `Measure-VmHappiness`/`Get-MigrationRuleImpact`, not mocked) onto the synthetic idle node; does not absorb already-happy VMs; warns when the hypothetical node's assumed network utilization is at or above the gate; only absorbs as many VMs as the synthetic node's memory headroom allows (greedy state update).
+
+### `Send-HvDRSNotification.Tests.ps1` — 7 tests
+
+Tests `Functions/Private/Send-HvDRSNotification.ps1`, with `Invoke-RestMethod`, `New-EventLog`, `Write-EventLog`, and the `Test-HvDrsEventLogSourceExists` wrapper (see its doc comment for why `[System.Diagnostics.EventLog]::SourceExists` is wrapped — it's a Windows-only API that throws on Linux/macOS dev and CI machines) all mocked.
+
+- Does nothing when neither `-WebhookUrl` nor `-WriteEventLog` is set.
+- POSTs the JSON-serialized payload to `-WebhookUrl`; a POST failure warns instead of throwing.
+- Creates the event log source only when it doesn't already exist, then writes the entry; a write failure warns instead of throwing.
+- Sends to both channels when both are specified.
+
+---
+
 ## What Is Not Tested
 
-The following require a live Hyper-V Failover Cluster and are not covered by the unit test suite:
+The following require a live Hyper-V Failover Cluster (or a real SCOM/VMM environment, for ProPack) and are not covered by the unit test suite:
 
 | Component | Reason |
 |---|---|
 | `Get-ClusterSnapshot` | Calls `Invoke-Command` against real cluster nodes, `Get-Counter`, `Get-VM`, `Get-NetAdapterStatistics` |
-| `Invoke-HvDRS` | Orchestration layer; correctness depends on real cluster state |
-| `Move-ClusterVirtualMachineRole` | Requires cluster infrastructure |
+| `Invoke-HvDRS` / `Invoke-HvStorageDRS` | Orchestration layers; their own control flow is unit-tested with everything mocked, but end-to-end correctness against a real cluster is not |
+| `Move-ClusterVirtualMachineRole` / `Suspend-ClusterNode` / `Resume-ClusterNode` | Require cluster infrastructure |
 | `Get-StorageSnapshot` | Calls `Get-ClusterSharedVolume`, `Get-VM`, `Get-VHD`, `Get-Counter` against live cluster |
-| `Invoke-HvStorageDRS` | Orchestration layer; correctness depends on real cluster and CSV state |
 | `Move-VMStorage` | Requires cluster infrastructure and CSV storage |
-| Maintenance helpers | Filesystem operations only; no non-trivial logic to unit test |
+| `Enter-HvDRSNodeMaintenance` / `Get-HvDRSCapacityForecast` | Orchestration layers over the above; control flow is unit-tested with mocks, real evacuation/placement against a live cluster is not |
+| Lock-file maintenance helpers (`Enable/Disable/Get-HvDRSMaintenance`) | Filesystem operations only; no non-trivial logic to unit test |
+| `Send-HvDRSNotification`'s actual network/event-log calls | `Invoke-RestMethod`/`Write-EventLog` are mocked; a real webhook endpoint or Windows event log is not exercised |
+| ProPack SCOM/VMM integration end-to-end | Requires a real SCOM + VMM lab — see `ProPack/PROPACK.md`'s manual lab checklist |
 
 Integration testing of those components is best done with `-WhatIf` or `-RecommendOnly` against a test cluster or a single-node Hyper-V lab.
