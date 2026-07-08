@@ -486,8 +486,11 @@ function Test-HvDRSStorageAffinityCompliance {
         catch { throw "No -ClusterName specified and no local cluster detected. $_" }
     }
 
-    $ruleSet = @(Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName |
-                Where-Object { $_.Type -in @('VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity') })
+    # See the matching comment in Invoke-HvStorageDRS.ps1 for why this captures
+    # into a variable before filtering rather than piping Get-AffinityRuleSet's
+    # output directly into Where-Object.
+    $allRules = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
+    $ruleSet  = @($allRules | Where-Object { $_.Type -in @('VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity') })
 
     if ($ruleSet.Count -eq 0) {
         Write-Host "No storage affinity rules are defined for cluster '$ClusterName'. Add rules with Add-HvDRSAffinityRule -Type VmCsvAffinity|VmCsvAntiAffinity|VmVmCsvAffinity|VmVmCsvAntiAffinity."

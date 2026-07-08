@@ -10,10 +10,14 @@ BeforeAll {
     . "$PSScriptRoot/../../Tests/Helpers/New-TestObjects.ps1"
 
     function Invoke-HvStorageDRS { param($ClusterName, [switch]$RecommendOnly, [switch]$PassThru, $AggressionLevel) }
-    function ConvertTo-HvDrsStorageProTip { param([Parameter(ValueFromPipeline)]$Recommendation) process { $Recommendation } }
     function Resolve-VmmStorageIdentity { param($VMId, $DestinationCsvName, $VMMServer) }
     function New-HvDrsScriptApi { }
 
+    # ConvertTo-HvDrsStorageProTip is a pure function with no external dependencies
+    # — dot-source the real implementation rather than stubbing it, so the objects
+    # flowing through this probe actually have Title/Description/Urgency/TriggerType
+    # set, matching production behavior.
+    . "$PSScriptRoot/../Scripts/ConvertTo-HvDrsStorageProTip.ps1"
     . "$PSScriptRoot/../Scripts/Invoke-HvDrsStorageProTipProbe.ps1"
 
     function New-FakeBag {

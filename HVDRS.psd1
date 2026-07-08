@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.6.0'
+    ModuleVersion     = '1.6.1'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -45,6 +45,28 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.6.1
+- Fixed latent bugs, of the same class fixed in 1.5.1, that only surfaced under
+  Set-StrictMode (which the publish pipeline enables) and were caught while
+  preparing this release:
+  - Invoke-HvStorageDRS and Test-HvDRSStorageAffinityCompliance both piped
+    Get-AffinityRuleSet's output directly into Where-Object to filter storage
+    rule types. When no rules are configured at all, this threw under strict
+    mode — PowerShell enumerates the ",@()" empty-result wrapper as a single
+    pipeline item when piped directly (rather than assigned to a variable
+    first), so the Where-Object script block's $_.Type access failed. Both
+    call sites now capture into a variable before filtering.
+  - Get-HvDRSVMAutomationLevel's no-"-VMName" branch returned an empty result
+    without the leading-comma protection Get-AffinityRuleSet and similar
+    loaders use, so it collapsed to $null (and threw on .Count) when no
+    overrides were configured for a cluster.
+  - Get-HvDRSCapacityForecast's -RemoveNode path could return $null for
+    VMPlacements/NodeImpact instead of an empty array when a node has no VMs
+    or a cluster has only one remaining node.
+  No production behavior changes for callers who already handled populated
+  results correctly — these only affected the zero-result / no-rules-configured
+  edge cases under strict-mode callers.
+
 ## 1.6.0
 - Added -TrendWindow / -HistoryPath to Invoke-HvDRS: optional rolling-average
   smoothing of node CPU/network utilization and VM CPU/memory-pressure across

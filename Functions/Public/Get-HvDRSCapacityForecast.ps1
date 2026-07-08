@@ -232,8 +232,12 @@ function Get-HvDRSCapacityForecast {
             Scenario     = 'RemoveNode'
             TargetNode   = $RemoveNode
             Feasible     = $feasible
-            VMPlacements = $placements
-            NodeImpact   = $nodeImpact
+            # @()-wrapped: a foreach-as-expression with zero iterations (e.g. no
+            # VMs on the node, or a single-node cluster) yields $null rather than
+            # an empty array, which would otherwise make .Count throw under
+            # Set-StrictMode for a caller that doesn't already know to check.
+            VMPlacements = @($placements)
+            NodeImpact   = @($nodeImpact)
         }
     }
 

@@ -108,6 +108,9 @@ function Get-HvDRSVMAutomationLevel {
         return $matched
     }
 
+    # Same leading-comma-on-empty-only protection as Get-AffinityRuleSet — see
+    # its comments for why this must not be applied unconditionally.
+    if (@($overrides).Count -eq 0) { return ,@() }
     return $overrides
 }
 

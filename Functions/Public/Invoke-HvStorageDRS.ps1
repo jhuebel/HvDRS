@@ -166,9 +166,16 @@ function Invoke-HvStorageDRS {
     } elseif ($RecommendOnly) { 'RECOMMEND-ONLY' } else { 'AUTO-MIGRATE' }
 
     # ── Load storage affinity rules ────────────────────────────────────────────
+    # Capture into a variable before filtering rather than piping the function
+    # call directly into Where-Object: Get-AffinityRuleSet's ",@()" empty-result
+    # protection (see that function's comments) only survives a direct variable
+    # assignment. Piped straight into another command, PowerShell enumerates the
+    # comma-wrapper array and streams its single inner (empty) array through as
+    # one pipeline object instead of zero — so $_.Type below would throw under
+    # Set-StrictMode when no rules are configured at all.
     $storageRuleTypes = @('VmVmCsvAffinity','VmVmCsvAntiAffinity','VmCsvAffinity','VmCsvAntiAffinity')
-    $ruleSet   = @(Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName |
-                  Where-Object { $_.Type -in $storageRuleTypes })
+    $allRules  = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
+    $ruleSet   = @($allRules | Where-Object { $_.Type -in $storageRuleTypes })
     $ruleLabel = if ($ruleSet.Count -gt 0) { "$($ruleSet.Count) rule(s)" } else { 'none' }
 
     # ── Load per-VM automation-level overrides ─────────────────────────────────

@@ -111,7 +111,7 @@ Describe 'Get-HvDRSCapacityForecast -AddNode' {
 
         $warnings = Get-HvDRSCapacityForecast -ClusterName 'TEST-CLUSTER' -AddNode 'NODE9' -AddNodeNetworkUtil 80.0 3>&1 6>&1 | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
 
-        $warnings.Count | Should -BeGreaterThan 0
+        @($warnings).Count | Should -BeGreaterThan 0
         $result = Get-HvDRSCapacityForecast -ClusterName 'TEST-CLUSTER' -AddNode 'NODE9' -AddNodeNetworkUtil 80.0 -WarningAction SilentlyContinue
         $result.AbsorbedRecommendations.Count | Should -Be 0
     }

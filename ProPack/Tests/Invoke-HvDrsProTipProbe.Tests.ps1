@@ -10,9 +10,13 @@ BeforeAll {
     . "$PSScriptRoot/../../Tests/Helpers/New-TestObjects.ps1"
 
     function Invoke-HvDRS { param($ClusterName, [switch]$RecommendOnly, [switch]$PassThru, $AggressionLevel) }
-    function ConvertTo-HvDrsProTip { param([Parameter(ValueFromPipeline)]$Recommendation) process { $Recommendation } }
     function Resolve-VmmIdentity { param($VMId, $DestinationNodeName, $VMMServer) }
 
+    # ConvertTo-HvDrsProTip is a pure function with no external dependencies (see
+    # its own doc comment) — dot-source the real implementation rather than
+    # stubbing it, so the objects flowing through this probe actually have
+    # Title/Description/Urgency/TriggerType set, matching production behavior.
+    . "$PSScriptRoot/../Scripts/ConvertTo-HvDrsProTip.ps1"
     . "$PSScriptRoot/../Scripts/Invoke-HvDrsProTipProbe.ps1"
 
     function New-FakeBag {
