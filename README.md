@@ -6,6 +6,8 @@ A PowerShell module that brings VMware DRS-style **VM Happiness** load balancing
 
 Inspired by the per-VM happiness model introduced in vSphere 7, HVDRS scores every running VM on a **0–100 happiness scale** based on whether it is receiving the CPU and memory resources it demands. Unhappy VMs are automatically live-migrated to better-suited nodes, subject to cluster ownership constraints and a **Network-Aware destination filter** that prevents saturating host NICs.
 
+> ⚠️ **Disclaimer:** HVDRS is provided "as is," without warranty of any kind, express or implied — see the [MIT License](LICENSE). It automates live migrations and storage moves against production Failover Clusters; while it includes `-WhatIf`, `-RecommendOnly`, and maintenance-mode safeguards, **you are solely responsible for validating its behavior in a non-production environment before running it against production infrastructure**, and for any outcome of using it, including data loss, downtime, or workload disruption. By using HVDRS, you accept full responsibility and liability for its use — the author(s) and contributors accept none.
+
 ---
 
 ## Features
