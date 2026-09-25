@@ -58,6 +58,8 @@ If your environment already runs System Center VMM, its **Dynamic Optimization (
 
 **Net takeaway:** DO is effective at preventing gross cluster-wide imbalance, but it's a coarser instrument — it optimizes the *cluster's* variance, not any individual VM's experience. HVDRS is most worth using over DO when you care about catching VM-level unhappiness that a healthy-looking host average can hide, when you need real affinity (not just anti-affinity) or CSV-level storage balancing, or when you don't want to stand up/license SCVMM at all.
 
+See [docs/VMWARE_DRS_COMPARISON.md](docs/VMWARE_DRS_COMPARISON.md) for how HVDRS compares against the tool it's actually modeled on: full VMware vSphere DRS.
+
 ---
 
 ## Optional: VMM PRO Tips Integration
@@ -228,7 +230,8 @@ Same thresholds apply to both compute and storage DRS:
 See [docs/INSTALL.md](docs/INSTALL.md) for full prerequisites and deployment instructions.  
 See [docs/USAGE.md](docs/USAGE.md) for detailed examples, scheduling, and tuning guidance.  
 See [docs/TESTS.md](docs/TESTS.md) for the test suite layout, coverage details, and how to run the tests.  
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module's internal design.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module's internal design.  
+See [docs/VMWARE_DRS_COMPARISON.md](docs/VMWARE_DRS_COMPARISON.md) for a feature-by-feature comparison against full VMware vSphere DRS — what HVDRS reimplements, what it doesn't, and why.
 
 ---
 
