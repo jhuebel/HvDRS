@@ -196,71 +196,138 @@ function Find-MigrationCandidates {
         }
     }
 
+    # ── Helper: how badly a single enforced rule is currently violated ─────────
+    # 0 = satisfied. Used by Pass 1 to recognize a move that only partially
+    # resolves a rule spanning 3+ VMs (e.g. three VMs sharing one host under a
+    # hard anti-affinity rule — no single move can fully separate all three),
+    # so that move is still taken instead of being rejected outright the way a
+    # strictly binary "is it fixed yet?" check would.
+    $ruleSeverity = {
+        param($rule, $placement)
+        switch ($rule.Type) {
+            'VmVmAffinity' {
+                $hosts = @($rule.VMs | Where-Object { $placement.ContainsKey($_) } | ForEach-Object { $placement[$_] })
+                if ($hosts.Count -eq 0) { return 0 }
+                # Excess distinct hosts beyond the one they should all share
+                return [Math]::Max(0, (@($hosts | Select-Object -Unique)).Count - 1)
+            }
+            'VmVmAntiAffinity' {
+                $hosts = @($rule.VMs | Where-Object { $placement.ContainsKey($_) } | ForEach-Object { $placement[$_] })
+                if ($hosts.Count -eq 0) { return 0 }
+                # VMs "doubled up" beyond one-per-host — 0 when every member has its own host
+                return [Math]::Max(0, $hosts.Count - (@($hosts | Select-Object -Unique)).Count)
+            }
+            'VmHostAffinity' {
+                return @($rule.VMs | Where-Object {
+                    $placement.ContainsKey($_) -and ($rule.Hosts -notcontains $placement[$_])
+                }).Count
+            }
+            'VmHostAntiAffinity' {
+                return @($rule.VMs | Where-Object {
+                    $placement.ContainsKey($_) -and ($rule.Hosts -contains $placement[$_])
+                }).Count
+            }
+            default { return 0 }
+        }
+    }
+
     # ════════════════════════════════════════════════════════════════════════════
     # PASS 1 — Compliance migrations (fix enforced-rule violations first)
     # ════════════════════════════════════════════════════════════════════════════
+    # Iterates over the enforced rules themselves (via $ruleSeverity), not a
+    # one-shot list of Test-AffinityCompliance violations: a rule spanning 3+
+    # VMs (e.g. a hard anti-affinity group of three VMs sharing one host) can
+    # need more than one move to fully satisfy, and no single move may resolve
+    # it outright. Each iteration re-evaluates every violated rule's severity
+    # against the current simulated placement and takes whichever move reduces
+    # some rule's severity the most (ties broken by projected happiness),
+    # repeating until every enforced rule is satisfied or no move helps at all.
     if ($RuleSet -and $RuleSet.Count -gt 0) {
-        $hardViolations = @(Test-AffinityCompliance -Snapshot $Snapshot -RuleSet $RuleSet |
-                            Where-Object { $_.Enforced })
+        $enforcedRules = @($RuleSet | Where-Object {
+            $_.Enforced -and $_.Type -in @('VmVmAffinity', 'VmVmAntiAffinity', 'VmHostAffinity', 'VmHostAntiAffinity')
+        })
 
-        foreach ($violation in $hardViolations) {
-            $movable = @($violation.VMs | Where-Object {
-                -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
-            })
-            if ($movable.Count -eq 0) {
-                Write-Verbose "  No movable (non-Manual) VM found to resolve: $($violation.Description)"
-                continue
-            }
+        # Generous, non-load-bearing safety cap — see Find-StorageMigrationCandidates'
+        # matching per-source loop for the same reasoning. Each accepted iteration
+        # strictly reduces some rule's severity, which is bounded by VM count, so
+        # this always terminates well before the cap.
+        $maxComplianceIterations = $Snapshot.VMs.Count + $enforcedRules.Count + 1
 
-            $bestFix   = $null
-            $bestScore = -1
+        for ($iter = 0; $iter -lt $maxComplianceIterations; $iter++) {
+            $violatedRules = @($enforcedRules | Where-Object { (& $ruleSeverity $_ $simPlacement) -gt 0 })
+            if ($violatedRules.Count -eq 0) { break }
 
-            foreach ($vmName in $movable) {
-                $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
-                if (-not $vm) { continue }
+            $bestFix             = $null
+            $bestFixSeverityDrop = 0
+            $bestFixScore        = -1
 
-                $possibleOwners = & $getPossibleOwners $vmName
-                $candidates     = & $basicFilter $vm $possibleOwners $vm.HostNode
+            foreach ($rule in $violatedRules) {
+                $currentSeverity = & $ruleSeverity $rule $simPlacement
+                $movable = @($rule.VMs | Where-Object {
+                    $simPlacement.ContainsKey($_) -and -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
+                })
 
-                foreach ($candidate in $candidates) {
-                    $impact = Get-MigrationRuleImpact -VMName $vmName `
-                                                      -DestinationNode $candidate.NodeName `
-                                                      -Snapshot $Snapshot -RuleSet $RuleSet `
-                                                      -Placement $simPlacement
+                foreach ($vmName in $movable) {
+                    $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
+                    if (-not $vm) { continue }
 
-                    # Skip destinations that break another hard rule or don't fix this one
-                    if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
+                    $possibleOwners = & $getPossibleOwners $vmName
+                    $candidates     = & $basicFilter $vm $possibleOwners $simPlacement[$vmName]
 
-                    $projected = & $simulateAndScore $vm $candidate
-                    if ($projected.HappinessScore -gt $bestScore) {
-                        $bestScore = $projected.HappinessScore
-                        $currentScoreObj = $vmScores | Where-Object { $_.VMName -eq $vmName }
-                        $bestFix = [PSCustomObject]@{
-                            VMName             = $vmName
-                            VMId               = $vm.VMId
-                            SourceNode         = $vm.HostNode
-                            DestinationNode    = $candidate.NodeName
-                            CurrentScore       = $currentScoreObj.HappinessScore
-                            ProjectedScore     = [Math]::Round($projected.HappinessScore, 1)
-                            Improvement        = [Math]::Round($projected.HappinessScore - $currentScoreObj.HappinessScore, 1)
-                            CpuHappinessBefore = $currentScoreObj.CpuHappiness
-                            MemHappinessBefore = $currentScoreObj.MemHappiness
-                            CpuHappinessAfter  = [Math]::Round($projected.CpuHappiness, 1)
-                            MemHappinessAfter  = [Math]::Round($projected.MemHappiness, 1)
-                            ComplianceReason   = $violation.Description
+                    foreach ($candidate in $candidates) {
+                        $impact = Get-MigrationRuleImpact -VMName $vmName `
+                                                          -DestinationNode $candidate.NodeName `
+                                                          -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                          -Placement $simPlacement
+
+                        # Never accept a move that breaks a DIFFERENT enforced rule
+                        if ($impact.HasHardViolation) { continue }
+
+                        $hypothetical = $simPlacement.Clone()
+                        $hypothetical[$vmName] = $candidate.NodeName
+                        $severityDrop = $currentSeverity - (& $ruleSeverity $rule $hypothetical)
+                        if ($severityDrop -le 0) { continue }   # no progress on this rule
+
+                        $projected = & $simulateAndScore $vm $candidate
+                        if ($severityDrop -gt $bestFixSeverityDrop -or
+                            ($severityDrop -eq $bestFixSeverityDrop -and $projected.HappinessScore -gt $bestFixScore)) {
+                            $bestFixSeverityDrop = $severityDrop
+                            $bestFixScore        = $projected.HappinessScore
+                            $currentScoreObj     = $vmScores | Where-Object { $_.VMName -eq $vmName }
+                            $newSeverity         = $currentSeverity - $severityDrop
+                            $bestFix = [PSCustomObject]@{
+                                VMName             = $vmName
+                                VMId               = $vm.VMId
+                                SourceNode         = $simPlacement[$vmName]
+                                DestinationNode    = $candidate.NodeName
+                                CurrentScore       = $currentScoreObj.HappinessScore
+                                ProjectedScore     = [Math]::Round($projected.HappinessScore, 1)
+                                Improvement        = [Math]::Round($projected.HappinessScore - $currentScoreObj.HappinessScore, 1)
+                                CpuHappinessBefore = $currentScoreObj.CpuHappiness
+                                MemHappinessBefore = $currentScoreObj.MemHappiness
+                                CpuHappinessAfter  = [Math]::Round($projected.CpuHappiness, 1)
+                                MemHappinessAfter  = [Math]::Round($projected.MemHappiness, 1)
+                                ComplianceReason   = if ($newSeverity -eq 0) {
+                                    "Satisfies enforced $($rule.Type) rule '$($rule.Name)'"
+                                } else {
+                                    "Partially satisfies enforced $($rule.Type) rule '$($rule.Name)' ($newSeverity violation(s) remaining)"
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            if ($bestFix) {
-                $migrations.Add($bestFix)
-                [void]$scheduledVMs.Add($bestFix.VMName)
-                $fixVm = $Snapshot.VMs | Where-Object { $_.VMName -eq $bestFix.VMName }
-                & $applySimulatedMove $fixVm $bestFix.SourceNode $bestFix.DestinationNode
-            } else {
-                Write-Verbose "  No valid destination found to resolve: $($violation.Description)"
+            if (-not $bestFix) {
+                Write-Verbose ("  No move improves compliance for: {0}" -f
+                    (($violatedRules | ForEach-Object { $_.Name }) -join ', '))
+                break
             }
+
+            $migrations.Add($bestFix)
+            [void]$scheduledVMs.Add($bestFix.VMName)
+            $fixVm = $Snapshot.VMs | Where-Object { $_.VMName -eq $bestFix.VMName }
+            & $applySimulatedMove $fixVm $bestFix.SourceNode $bestFix.DestinationNode
         }
     }
 

@@ -460,7 +460,7 @@ HvDRS supports four rule types that constrain where VMs may run. Rules are store
 
 Add `-Enforced` when creating a rule to make it **hard**:
 
-- **Hard rule**: HvDRS will *never* execute a migration that would break it, and will proactively schedule compliance migrations to fix existing violations.
+- **Hard rule**: HvDRS will *never* execute a migration that would break it, and will proactively schedule compliance migrations to fix existing violations. For a `VmVmAffinity`/`VmVmAntiAffinity` rule (or the storage `VmVmCsvAffinity`/`VmVmCsvAntiAffinity` equivalents) covering three or more VMs, this can take more than one migration in the same pass — e.g. separating three VMs that all share one host needs two moves, since no single move can fully satisfy all three at once.
 - **Soft rule** (default): violations lower the candidate score by `-SoftRuleViolationPenalty` (default: 25 pts), but the migration is not blocked.
 
 ### Managing Rules

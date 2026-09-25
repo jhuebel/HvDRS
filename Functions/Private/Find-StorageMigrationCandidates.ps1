@@ -142,6 +142,38 @@ function Find-StorageMigrationCandidates {
         (Measure-CsvHappiness -CsvMetrics $proxy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
     }
 
+    # Helper: how badly a single enforced storage-affinity rule is currently
+    # violated (0 = satisfied). Mirrors Find-MigrationCandidates' $ruleSeverity
+    # — a VmVmCsvAffinity/VmVmCsvAntiAffinity rule spanning 3+ VMs can need more
+    # than one move to fully satisfy, so this lets Pass 1 recognize and accept a
+    # move that only partially resolves it.
+    $csvRuleSeverity = {
+        param($rule, $placement)
+        switch ($rule.Type) {
+            'VmVmCsvAffinity' {
+                $csvs = @($rule.VMs | Where-Object { $placement.ContainsKey($_) } | ForEach-Object { $placement[$_] })
+                if ($csvs.Count -eq 0) { return 0 }
+                return [Math]::Max(0, (@($csvs | Select-Object -Unique)).Count - 1)
+            }
+            'VmVmCsvAntiAffinity' {
+                $csvs = @($rule.VMs | Where-Object { $placement.ContainsKey($_) } | ForEach-Object { $placement[$_] })
+                if ($csvs.Count -eq 0) { return 0 }
+                return [Math]::Max(0, $csvs.Count - (@($csvs | Select-Object -Unique)).Count)
+            }
+            'VmCsvAffinity' {
+                return @($rule.VMs | Where-Object {
+                    $placement.ContainsKey($_) -and ($rule.CSVs -notcontains $placement[$_])
+                }).Count
+            }
+            'VmCsvAntiAffinity' {
+                return @($rule.VMs | Where-Object {
+                    $placement.ContainsKey($_) -and ($rule.CSVs -contains $placement[$_])
+                }).Count
+            }
+            default { return 0 }
+        }
+    }
+
     $scheduledVMs = [System.Collections.Generic.HashSet[string]]::new()
     $migrations   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -149,92 +181,116 @@ function Find-StorageMigrationCandidates {
     # PASS 1 — Storage rule compliance (fix enforced-rule violations first)
     # ════════════════════════════════════════════════════════════════════════════
     if ($RuleSet -and $RuleSet.Count -gt 0) {
-        $hardViolations = @(Test-StorageAffinityCompliance -Snapshot $Snapshot -RuleSet $RuleSet |
-                            Where-Object { $_.Enforced })
+        $enforcedStorageRules = @($RuleSet | Where-Object {
+            $_.Enforced -and $_.Type -in @('VmVmCsvAffinity', 'VmVmCsvAntiAffinity', 'VmCsvAffinity', 'VmCsvAntiAffinity')
+        })
 
-        foreach ($violation in $hardViolations) {
-            $movable = @($violation.VMs | Where-Object {
-                -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
-            })
-            if ($movable.Count -eq 0) {
-                Write-Verbose "  No movable (non-Manual) VM found to resolve: $($violation.Description)"
-                continue
-            }
+        # See Find-MigrationCandidates' matching loop for why this iterates
+        # rules (via $csvRuleSeverity) rather than a one-shot violation list,
+        # and for why this cap is generous but non-load-bearing.
+        $maxComplianceIterations = $Snapshot.VMs.Count + $enforcedStorageRules.Count + 1
 
-            $bestFix   = $null
-            $bestScore = -1
+        for ($iter = 0; $iter -lt $maxComplianceIterations; $iter++) {
+            $violatedRules = @($enforcedStorageRules | Where-Object { (& $csvRuleSeverity $_ $vmCsvName) -gt 0 })
+            if ($violatedRules.Count -eq 0) { break }
 
-            foreach ($vmName in $movable) {
-                $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
-                if (-not $vm) { continue }
+            $bestFix             = $null
+            $bestFixSeverityDrop = 0
+            $bestFixScore        = -1
 
-                $srcName = $vmCsvName[$vmName]
-                $simSrcForVm = $simCsvs[$srcName]
-                if (-not $simSrcForVm) { continue }
+            foreach ($rule in $violatedRules) {
+                $currentSeverity = & $csvRuleSeverity $rule $vmCsvName
+                $movable = @($rule.VMs | Where-Object {
+                    $vmCsvName.ContainsKey($_) -and -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
+                })
 
-                $candidates = $simCsvs.Values | Where-Object {
-                    $_.Name -ne $srcName -and
-                    ($_.FreeGB - $vm.TotalVhdGB) -ge $MinFreeGBReserve
-                }
+                foreach ($vmName in $movable) {
+                    $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $vmName }
+                    if (-not $vm) { continue }
 
-                foreach ($dst in $candidates) {
-                    $impact = Get-StorageMigrationRuleImpact -VMName $vmName -DestinationCsvName $dst.Name `
-                                                              -Snapshot $Snapshot -RuleSet $RuleSet `
-                                                              -Placement $vmCsvName
+                    $srcName = $vmCsvName[$vmName]
+                    $simSrcForVm = $simCsvs[$srcName]
+                    if (-not $simSrcForVm) { continue }
 
-                    if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
-
-                    $dstFreeAfter = $dst.FreeGB - $vm.TotalVhdGB
-                    $dstSimCopy   = [PSCustomObject]@{
-                        Name = $dst.Name; TotalGB = $dst.TotalGB
-                        FreeGB = $dstFreeAfter; LatencyMs = $dst.LatencyMs
+                    $candidates = $simCsvs.Values | Where-Object {
+                        $_.Name -ne $srcName -and
+                        ($_.FreeGB - $vm.TotalVhdGB) -ge $MinFreeGBReserve
                     }
-                    $projectedDstScore = & $scoreSimCsv $dstSimCopy
 
-                    if ($projectedDstScore -gt $bestScore) {
-                        $bestScore = $projectedDstScore
+                    foreach ($dst in $candidates) {
+                        $impact = Get-StorageMigrationRuleImpact -VMName $vmName -DestinationCsvName $dst.Name `
+                                                                  -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                                  -Placement $vmCsvName
 
-                        $srcFreeAfter = $simSrcForVm.FreeGB + $vm.TotalVhdGB
-                        $srcSimCopy   = [PSCustomObject]@{
-                            Name = $simSrcForVm.Name; TotalGB = $simSrcForVm.TotalGB
-                            FreeGB = $srcFreeAfter; LatencyMs = $simSrcForVm.LatencyMs
+                        # Never accept a move that breaks a DIFFERENT enforced rule
+                        if ($impact.HasHardViolation) { continue }
+
+                        $hypothetical = $vmCsvName.Clone()
+                        $hypothetical[$vmName] = $dst.Name
+                        $severityDrop = $currentSeverity - (& $csvRuleSeverity $rule $hypothetical)
+                        if ($severityDrop -le 0) { continue }   # no progress on this rule
+
+                        $dstFreeAfter = $dst.FreeGB - $vm.TotalVhdGB
+                        $dstSimCopy   = [PSCustomObject]@{
+                            Name = $dst.Name; TotalGB = $dst.TotalGB
+                            FreeGB = $dstFreeAfter; LatencyMs = $dst.LatencyMs
                         }
-                        $projectedSrcScore = & $scoreSimCsv $srcSimCopy
+                        $projectedDstScore = & $scoreSimCsv $dstSimCopy
 
-                        $bestFix = [PSCustomObject]@{
-                            VMName             = $vmName
-                            VMId               = $vm.VMId
-                            HostNode           = $vm.HostNode
-                            SourceCSV          = $simSrcForVm.Path
-                            SourceCSVName      = $simSrcForVm.Name
-                            DestinationCSV     = $dst.Path
-                            DestinationCSVName = $dst.Name
-                            VHDCount           = $vm.VHDs.Count
-                            TotalVhdGB         = $vm.TotalVhdGB
-                            SourceFreeGBBefore = [Math]::Round($simSrcForVm.FreeGB, 1)
-                            SourceFreeGBAfter  = [Math]::Round($srcFreeAfter, 1)
-                            DestFreeGBBefore   = [Math]::Round($dst.FreeGB, 1)
-                            DestFreeGBAfter    = [Math]::Round($dstFreeAfter, 1)
-                            SourceScoreBefore  = $initialScores[$srcName]
-                            SourceScoreAfter   = [Math]::Round($projectedSrcScore, 1)
-                            DestScoreBefore    = $initialScores[$dst.Name]
-                            DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
-                            Improvement        = [Math]::Round($projectedSrcScore - $initialScores[$srcName], 1)
-                            ComplianceReason   = $violation.Description
+                        if ($severityDrop -gt $bestFixSeverityDrop -or
+                            ($severityDrop -eq $bestFixSeverityDrop -and $projectedDstScore -gt $bestFixScore)) {
+                            $bestFixSeverityDrop = $severityDrop
+                            $bestFixScore        = $projectedDstScore
+                            $newSeverity         = $currentSeverity - $severityDrop
+
+                            $srcFreeAfter = $simSrcForVm.FreeGB + $vm.TotalVhdGB
+                            $srcSimCopy   = [PSCustomObject]@{
+                                Name = $simSrcForVm.Name; TotalGB = $simSrcForVm.TotalGB
+                                FreeGB = $srcFreeAfter; LatencyMs = $simSrcForVm.LatencyMs
+                            }
+                            $projectedSrcScore = & $scoreSimCsv $srcSimCopy
+
+                            $bestFix = [PSCustomObject]@{
+                                VMName             = $vmName
+                                VMId               = $vm.VMId
+                                HostNode           = $vm.HostNode
+                                SourceCSV          = $simSrcForVm.Path
+                                SourceCSVName      = $simSrcForVm.Name
+                                DestinationCSV     = $dst.Path
+                                DestinationCSVName = $dst.Name
+                                VHDCount           = $vm.VHDs.Count
+                                TotalVhdGB         = $vm.TotalVhdGB
+                                SourceFreeGBBefore = [Math]::Round($simSrcForVm.FreeGB, 1)
+                                SourceFreeGBAfter  = [Math]::Round($srcFreeAfter, 1)
+                                DestFreeGBBefore   = [Math]::Round($dst.FreeGB, 1)
+                                DestFreeGBAfter    = [Math]::Round($dstFreeAfter, 1)
+                                SourceScoreBefore  = $initialScores[$srcName]
+                                SourceScoreAfter   = [Math]::Round($projectedSrcScore, 1)
+                                DestScoreBefore    = $initialScores[$dst.Name]
+                                DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
+                                Improvement        = [Math]::Round($projectedSrcScore - $initialScores[$srcName], 1)
+                                ComplianceReason   = if ($newSeverity -eq 0) {
+                                    "Satisfies enforced $($rule.Type) rule '$($rule.Name)'"
+                                } else {
+                                    "Partially satisfies enforced $($rule.Type) rule '$($rule.Name)' ($newSeverity violation(s) remaining)"
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            if ($bestFix) {
-                $migrations.Add($bestFix)
-                [void]$scheduledVMs.Add($bestFix.VMName)
-                $simCsvs[$bestFix.SourceCSVName].FreeGB      += $bestFix.TotalVhdGB
-                $simCsvs[$bestFix.DestinationCSVName].FreeGB -= $bestFix.TotalVhdGB
-                $vmCsvName[$bestFix.VMName] = $bestFix.DestinationCSVName
-            } else {
-                Write-Verbose "  No valid CSV destination found to resolve: $($violation.Description)"
+            if (-not $bestFix) {
+                Write-Verbose ("  No move improves storage compliance for: {0}" -f
+                    (($violatedRules | ForEach-Object { $_.Name }) -join ', '))
+                break
             }
+
+            $migrations.Add($bestFix)
+            [void]$scheduledVMs.Add($bestFix.VMName)
+            $simCsvs[$bestFix.SourceCSVName].FreeGB      += $bestFix.TotalVhdGB
+            $simCsvs[$bestFix.DestinationCSVName].FreeGB -= $bestFix.TotalVhdGB
+            $vmCsvName[$bestFix.VMName] = $bestFix.DestinationCSVName
         }
     }
 

@@ -162,48 +162,62 @@ Verifies property names (`VMName`, `HostNode`, `CpuHappiness`, `MemHappiness`, `
 
 ---
 
-### `Find-MigrationCandidates.Tests.ps1` — 18 tests
+### `Find-MigrationCandidates.Tests.ps1` — 35 tests
 
 Tests the two-pass migration planning logic in `Functions/Private/Find-MigrationCandidates.ps1`. All calls to `Get-ClusterOwnerNode` are mocked; the FailoverClusters module is not required.
 
-**Basic Triggering** (2 tests)
+**Basic migration triggering** (2 tests)
 
 - An unhappy VM (score < aggression threshold) produces a migration recommendation.
 - All-happy VMs produce no recommendations.
 
-**Network-Aware Filtering** (3 tests)
+**Network-Aware destination filtering** (3 tests)
 
 - A destination node at or above `-MaxDestinationNetworkUtil` (default 70%) is excluded.
 - A destination node below the gate is included.
 - A custom gate value (e.g. 50%) is respected.
 
-**Memory Constraints** (2 tests)
+**Memory constraints** (2 tests)
 
 - A destination that would leave less than `-DestinationMemoryReserveMB` (default 512 MB) free after migration is excluded.
 - A destination with sufficient post-migration headroom is included.
 
-**Cluster Ownership Constraints** (2 tests)
+**Cluster ownership constraints** (4 tests)
 
 - When `Get-ClusterOwnerNode` returns a restricted owner list, only listed nodes are considered as destinations.
 - Possible owners are read from the VM *resource* (`-Resource 'Virtual Machine <name>'`), not the role/group.
 - When `Get-ClusterOwnerNode` returns an empty owner list, all cluster nodes are treated as eligible.
 - When `Get-ClusterOwnerNode` throws (resource not found, module absent), all cluster nodes are treated as eligible.
 
-**Aggression Levels** (4 tests)
+**Aggression levels** (4 tests)
 
 - A VM with score=65 is **not** migrated at level 4 (threshold=60; 65 is not below 60).
 - The same VM **is** migrated at level 5 (threshold=70; 65 < 70).
 - A VM with a small available improvement (12.5 pts) is **not** migrated at level 1 (minimum +40).
 - The same VM **is** migrated at level 5 (minimum +10; 12.5 ≥ 10).
 
-**Migration Plan Output** (9 tests)
+**Migration plan output** (10 tests)
 
 Verifies all fields on the returned migration object: `VMName`, `VMId`, `SourceNode`, `DestinationNode`, `CurrentScore`, `ProjectedScore`, `Improvement`, `CpuHappinessBefore`, `MemHappinessBefore`, `CpuHappinessAfter`, `MemHappinessAfter`. Also verifies that when multiple destinations exist, the one offering the greatest improvement is chosen.
 
-**Greedy State Update** (2 tests)
+**Greedy state update** (2 tests)
 
 - Two equally unhappy VMs on a source node; destination has memory for only one. After the first migration is planned and the simulated `AvailableMemoryMB` on the destination is decremented, the second VM is correctly excluded (post-migration free memory would fall below the reserve).
 - No VM appears in the migration list more than once.
+
+**Rule impact uses simulated placement** (1 test)
+
+- Two anti-affinity VMs sharing a hot node: the compliance move for the first VM is reflected in the placement `Get-MigrationRuleImpact` sees for the second, so it doesn't co-locate them onto the same destination the first move just used (regression test for the fix described in [ARCHITECTURE.md](ARCHITECTURE.md)).
+
+**ExcludedVMs (Manual-pinned)** (4 tests)
+
+- A VM pinned to Manual is never chosen for a happiness-based migration, even as the only unhappy VM; a non-excluded VM is still migrated. An excluded VM is skipped as a hard-rule compliance fix in favor of a movable one; when the excluded VM is the only violator, no migration is produced.
+
+**Multi-VM hard-rule compliance (3+ VMs)** (3 tests)
+
+- A 3-VM hard `VmVmAntiAffinity` violation (all three sharing one host) is resolved with two migrations — one move can't fully separate three VMs, so a move that only partially resolves the rule is accepted, and the compliance loop keeps going until every VM has its own host.
+- A 3-VM hard `VmVmAffinity` violation (three VMs spread across three hosts, needing consolidation) is likewise resolved with two migrations, ending with all three on one host.
+- A rule of a type this planner doesn't handle (a storage-only type referencing compute VMs) is silently ignored rather than throwing.
 
 ---
 
@@ -400,7 +414,7 @@ Tests the CSV happiness scoring formula in `Functions/Private/Measure-CsvHappine
 
 ---
 
-### `Find-StorageMigrationCandidates.Tests.ps1` — 30 tests
+### `Find-StorageMigrationCandidates.Tests.ps1` — 31 tests
 
 Tests the storage migration planning logic in `Functions/Private/Find-StorageMigrationCandidates.ps1`. No cluster or Hyper-V cmdlets are called.
 
@@ -443,6 +457,10 @@ Verifies all fields on the returned migration object: `VMName`, `HostNode`, `Sou
 **ExcludedVMs (Manual-pinned)** (4 tests)
 
 - A VM pinned to Manual is never chosen for a happiness-based move, even as the only VM on the only unhappy CSV; a non-excluded VM on the same CSV is still recommended; an excluded VM is skipped as a hard-rule compliance fix in favor of a movable one; when the excluded VM is the only violator, no migration is produced (rather than picking it anyway).
+
+**Multi-VM hard-rule compliance (3+ VMs)** (1 test)
+
+- A 3-VM hard `VmVmCsvAntiAffinity` violation (all three VMs on one CSV) is resolved with two migrations — mirroring `Find-MigrationCandidates`' compute-side fix, one move can't fully separate three VMs across CSVs, so a partially-resolving move is accepted and the compliance loop continues until all three land on distinct CSVs.
 
 ---
 

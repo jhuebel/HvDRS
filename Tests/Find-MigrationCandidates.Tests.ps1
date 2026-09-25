@@ -7,6 +7,12 @@ BeforeAll {
 
     . "$PSScriptRoot\Helpers\New-TestObjects.ps1"
     . "$PSScriptRoot\..\Functions\Private\Measure-VmHappiness.ps1"
+    # Get-MigrationRuleImpact is a runtime dependency of Find-MigrationCandidates
+    # itself (called internally whenever -RuleSet is non-empty), so it must be in
+    # scope here at the file level — not only inside the one Describe block below
+    # that happens to reference it directly — or every other Describe's tests
+    # that pass -RuleSet would fail to resolve it.
+    . "$PSScriptRoot\..\Functions\Private\Get-MigrationRuleImpact.ps1"
     . "$PSScriptRoot\..\Functions\Private\Find-MigrationCandidates.ps1"
 }
 
@@ -395,11 +401,9 @@ Describe 'Find-MigrationCandidates' {
 
     # ── Rule checks see moves planned earlier in the same pass ─────────────────
     Describe 'Rule impact uses simulated placement' {
-
-        BeforeAll {
-            . "$PSScriptRoot\..\Functions\Private\Test-AffinityCompliance.ps1"
-            . "$PSScriptRoot\..\Functions\Private\Get-MigrationRuleImpact.ps1"
-        }
+        # Get-MigrationRuleImpact is already dot-sourced at file scope above
+        # (Find-MigrationCandidates depends on it internally); nothing extra
+        # needed here since Pass 1 no longer calls Test-AffinityCompliance.
 
         It 'does not move a second anti-affinity member onto the node a compliance move just used' {
             # DC1 + DC2 (hard anti-affinity) share hot NODE1. Pass 1 moves DC1 to the
@@ -489,6 +493,80 @@ Describe 'Find-MigrationCandidates' {
                                                  -RuleSet @($rule) -ClusterName 'TEST' `
                                                  -ExcludedVMs @('PINNED') -Verbose 4>$null)
             $result.Count | Should -Be 0
+        }
+    }
+
+    Describe 'Multi-VM hard-rule compliance (3+ VMs)' {
+
+        It 'resolves a 3-VM hard anti-affinity violation with two moves when one is not enough' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $n1 = New-HostMetrics -Name 'NODE1' -CpuUtil 100.0 -AvailMemMB 60000 -LPs 32 -NetUtil 10.0
+            $n2 = New-HostMetrics -Name 'NODE2' -CpuUtil 10.0  -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $n3 = New-HostMetrics -Name 'NODE3' -CpuUtil 50.0  -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $dc1 = New-VmMetrics -Name 'DC1' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $dc2 = New-VmMetrics -Name 'DC2' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $dc3 = New-VmMetrics -Name 'DC3' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $snap = New-Snapshot -Nodes @($n1, $n2, $n3) -VMs @($dc1, $dc2, $dc3)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'DC AA'; Type = 'VmVmAntiAffinity'; Enforced = $true
+                VMs = @('DC1', 'DC2', 'DC3'); Hosts = @(); CSVs = @()
+            }
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -RuleSet @($rule) -ClusterName 'TEST')
+
+            # Both compliance moves land, in two separate migrations, and every DC
+            # ends up on a distinct node.
+            $result.Count | Should -Be 2
+            $result | Where-Object { $_.ComplianceReason } | Measure-Object | Select-Object -ExpandProperty Count | Should -Be 2
+
+            $finalHost = @{ DC1 = 'NODE1'; DC2 = 'NODE1'; DC3 = 'NODE1' }
+            foreach ($m in $result) { $finalHost[$m.VMName] = $m.DestinationNode }
+            (@($finalHost.Values) | Select-Object -Unique).Count | Should -Be 3
+        }
+
+        It 'consolidates a 3-VM hard affinity violation with two moves when one is not enough' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            # Three lightly-loaded VMs, each alone on its own node, must all share one host.
+            $n1 = New-HostMetrics -Name 'NODE1' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $n2 = New-HostMetrics -Name 'NODE2' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $n3 = New-HostMetrics -Name 'NODE3' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $web1 = New-VmMetrics -Name 'WEB1' -HostNode 'NODE1' -CpuUtil 10.0 -Procs 2 -MemAssignMB 4096
+            $web2 = New-VmMetrics -Name 'WEB2' -HostNode 'NODE2' -CpuUtil 10.0 -Procs 2 -MemAssignMB 4096
+            $web3 = New-VmMetrics -Name 'WEB3' -HostNode 'NODE3' -CpuUtil 10.0 -Procs 2 -MemAssignMB 4096
+            $snap = New-Snapshot -Nodes @($n1, $n2, $n3) -VMs @($web1, $web2, $web3)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'WEB Affinity'; Type = 'VmVmAffinity'; Enforced = $true
+                VMs = @('WEB1', 'WEB2', 'WEB3'); Hosts = @(); CSVs = @()
+            }
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -RuleSet @($rule) -ClusterName 'TEST')
+
+            $result.Count | Should -Be 2
+
+            $finalHost = @{ WEB1 = 'NODE1'; WEB2 = 'NODE2'; WEB3 = 'NODE3' }
+            foreach ($m in $result) { $finalHost[$m.VMName] = $m.DestinationNode }
+            (@($finalHost.Values) | Select-Object -Unique).Count | Should -Be 1
+        }
+
+        It 'does not attempt a rule move for a rule type outside the 4 handled compute types' {
+            # A rule of an unrecognized/storage-only type referencing compute VMs
+            # must be ignored (severity 0) rather than throwing.
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $n1 = New-HostMetrics -Name 'NODE1' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $vm1 = New-VmMetrics -Name 'VM1' -HostNode 'NODE1' -CpuUtil 10.0
+            $snap = New-Snapshot -Nodes @($n1) -VMs @($vm1)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'Irrelevant'; Type = 'VmCsvAffinity'; Enforced = $true
+                VMs = @('VM1'); Hosts = @(); CSVs = @('Volume1')
+            }
+
+            { Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 -RuleSet @($rule) -ClusterName 'TEST' } |
+                Should -Not -Throw
         }
     }
 }

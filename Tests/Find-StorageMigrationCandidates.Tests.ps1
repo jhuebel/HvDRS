@@ -379,3 +379,32 @@ Describe 'Find-StorageMigrationCandidates — ExcludedVMs (Manual-pinned)' {
         $result.Count | Should -Be 0
     }
 }
+
+Describe 'Find-StorageMigrationCandidates — multi-VM hard-rule compliance (3+ VMs)' {
+
+    It 'resolves a 3-VM hard storage anti-affinity violation with two moves when one is not enough' {
+        # Three VMs all on Volume1 must each land on a different CSV. All three
+        # CSVs are otherwise happy and roomy, so this exercises compliance in
+        # isolation from any happiness-driven rebalancing.
+        $vol1 = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 800
+        $vol2 = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 1000 -FreeGB 800
+        $vol3 = New-CsvMetrics -Name 'Volume3' -Path 'C:\ClusterStorage\Volume3' -TotalGB 1000 -FreeGB 800
+        $vm1 = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $vm2 = New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $vm3 = New-VmStorageMetrics -Name 'VM3' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $snap = New-StorageSnapshot -CSVs @($vol1, $vol2, $vol3) -VMs @($vm1, $vm2, $vm3)
+        $rule = [PSCustomObject]@{
+            RuleId = 'r1'; Name = 'Split3'; Type = 'VmVmCsvAntiAffinity'; Enforced = $true
+            VMs = @('VM1', 'VM2', 'VM3'); CSVs = @()
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -RuleSet @($rule))
+
+        $result.Count | Should -Be 2
+        ($result | Where-Object { $_.ComplianceReason }).Count | Should -Be 2
+
+        $finalCsv = @{ VM1 = 'Volume1'; VM2 = 'Volume1'; VM3 = 'Volume1' }
+        foreach ($m in $result) { $finalCsv[$m.VMName] = $m.DestinationCSVName }
+        (@($finalCsv.Values) | Select-Object -Unique).Count | Should -Be 3
+    }
+}
