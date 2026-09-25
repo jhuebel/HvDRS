@@ -109,8 +109,12 @@ function Get-StorageSnapshot {
                     param($csvPath, $cnt, $interval)
                     $paths = (Get-Counter -ListSet 'LogicalDisk').PathsWithInstances |
                              Where-Object { $_ -match 'Avg\. Disk sec/Transfer' }
-                    $leafName = Split-Path -Leaf $csvPath
-                    $line = $paths | Where-Object { $_ -like "*$leafName*" -or $_ -like "*$csvPath*" } |
+                    # Match the leaf/full path as a whole path segment, not a bare
+                    # substring — "Volume1" must not match inside "Volume10".
+                    $leafName    = Split-Path -Leaf $csvPath
+                    $leafPattern = '(^|[\\/])' + [regex]::Escape($leafName)    + '($|[\\/)])'
+                    $pathPattern = '(^|[\\/])' + [regex]::Escape($csvPath)     + '($|[\\/)])'
+                    $line = $paths | Where-Object { $_ -match $leafPattern -or $_ -match $pathPattern } |
                             Select-Object -First 1
                     if (-not $line) { return $null }
                     $inst = [regex]::Match($line, '\((.+?)\)').Groups[1].Value
@@ -149,10 +153,21 @@ function Get-StorageSnapshot {
 
                 foreach ($drive in $drives) {
                     $sizeGB = try {
-                        [Math]::Round((Get-VHD -Path $drive.Path -ComputerName $node -ErrorAction Stop).Size / 1GB, 2)
+                        # FileSize is the VHD's actual footprint on disk right now —
+                        # what a storage move actually copies and what freeing it
+                        # actually returns to the source CSV. Size is the VHD's
+                        # maximum virtual/expandable size, which for a dynamic disk
+                        # (the common case) can be many times its real on-disk size
+                        # and badly overstates both the data moved and the space
+                        # freed/consumed on either side of a migration.
+                        [Math]::Round((Get-VHD -Path $drive.Path -ComputerName $node -ErrorAction Stop).FileSize / 1GB, 2)
                     } catch { 0.0 }
 
-                    $csvOwner = $csvList | Where-Object { $drive.Path -like "$($_.Path)*" } | Select-Object -First 1
+                    # Match the CSV as a whole path segment — "...\Volume1" must not
+                    # match a drive path under "...\Volume10\...".
+                    $csvOwner = $csvList | Where-Object {
+                        $drive.Path -like ($_.Path.TrimEnd('\') + '\*') -or $drive.Path -eq $_.Path
+                    } | Select-Object -First 1
                     $vhdDetails.Add([PSCustomObject]@{
                         Path   = $drive.Path
                         SizeGB = $sizeGB
