@@ -248,103 +248,122 @@ function Find-StorageMigrationCandidates {
                        Select-Object -ExpandProperty Key
 
     foreach ($srcName in $unhappyCsvNames) {
-        $simSrc = $simCsvs[$srcName]
-        if (-not $simSrc) { continue }
+        # A single move rarely brings a large, badly-unhappy CSV all the way up
+        # to the aggression threshold on its own. Keep planning moves off this
+        # SAME source — each iteration re-scores against the simulated state
+        # left by the previous one — until it's fixed or no VM on it can be
+        # beneficially moved anywhere. $vmsOnSrc strictly shrinks every
+        # iteration (a scheduled VM is never reconsidered), so this always
+        # terminates; the explicit cap is defense-in-depth, not a load-bearing
+        # guard.
+        for ($guard = 0; $guard -lt $Snapshot.VMs.Count; $guard++) {
+            $simSrc = $simCsvs[$srcName]
+            if (-not $simSrc) { break }
 
-        # Re-score against current simulated state; skip if already fixed
-        $currentSrcScore = & $scoreSimCsv $simSrc
-        if ($currentSrcScore -ge $happinessThreshold) { continue }
+            # Re-score against current simulated state; stop if already fixed
+            $currentSrcScore = & $scoreSimCsv $simSrc
+            if ($currentSrcScore -ge $happinessThreshold) { break }
 
-        # VMs whose primary storage is on this CSV, not yet scheduled, and not
-        # pinned to Manual automation
-        $vmsOnSrc = $Snapshot.VMs | Where-Object {
-            $pathToName[$_.PrimaryCSV] -eq $srcName -and
-            -not $scheduledVMs.Contains($_.VMName) -and
-            -not $excluded.Contains($_.VMName)
-        }
-        if (-not $vmsOnSrc) { continue }
-
-        $bestMigration   = $null
-        $bestImprovement = 0.0
-
-        foreach ($vm in $vmsOnSrc) {
-            # Candidate destinations: enough headroom after receiving this VM
-            $candidates = $simCsvs.Values | Where-Object {
-                $_.Name -ne $srcName -and
-                ($_.FreeGB - $vm.TotalVhdGB) -ge $MinFreeGBReserve
+            # VMs whose primary storage is on this CSV, not yet scheduled, and not
+            # pinned to Manual automation
+            $vmsOnSrc = $Snapshot.VMs | Where-Object {
+                $pathToName[$_.PrimaryCSV] -eq $srcName -and
+                -not $scheduledVMs.Contains($_.VMName) -and
+                -not $excluded.Contains($_.VMName)
             }
+            if (-not $vmsOnSrc) { break }
 
-            foreach ($dst in $candidates) {
-                # Storage rule impact check
-                $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
-                    Get-StorageMigrationRuleImpact -VMName $vm.VMName -DestinationCsvName $dst.Name `
-                                                   -Snapshot $Snapshot -RuleSet $RuleSet `
-                                                   -Placement $vmCsvName
-                } else {
-                    [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
+            $bestMigration   = $null
+            $bestImprovement = 0.0
+
+            foreach ($vm in $vmsOnSrc) {
+                # Candidate destinations: enough headroom after receiving this VM
+                $candidates = $simCsvs.Values | Where-Object {
+                    $_.Name -ne $srcName -and
+                    ($_.FreeGB - $vm.TotalVhdGB) -ge $MinFreeGBReserve
                 }
 
-                if ($impact.HasHardViolation) { continue }
+                foreach ($dst in $candidates) {
+                    # Storage rule impact check
+                    $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
+                        Get-StorageMigrationRuleImpact -VMName $vm.VMName -DestinationCsvName $dst.Name `
+                                                       -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                       -Placement $vmCsvName
+                    } else {
+                        [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
+                    }
 
-                # Simulate source after VM departs
-                $srcFreeAfter = $simSrc.FreeGB + $vm.TotalVhdGB
-                $srcSimCopy   = [PSCustomObject]@{
-                    Name = $simSrc.Name; TotalGB = $simSrc.TotalGB
-                    FreeGB = $srcFreeAfter; LatencyMs = $simSrc.LatencyMs
-                }
-                $projectedSrcScore = (Measure-CsvHappiness -CsvMetrics $srcSimCopy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
+                    if ($impact.HasHardViolation) { continue }
 
-                # Simulate destination after VM arrives
-                $dstFreeAfter = $dst.FreeGB - $vm.TotalVhdGB
-                $dstSimCopy   = [PSCustomObject]@{
-                    Name = $dst.Name; TotalGB = $dst.TotalGB
-                    FreeGB = $dstFreeAfter; LatencyMs = $dst.LatencyMs
-                }
-                $projectedDstScore = (Measure-CsvHappiness -CsvMetrics $dstSimCopy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
+                    # Simulate source after VM departs
+                    $srcFreeAfter = $simSrc.FreeGB + $vm.TotalVhdGB
+                    $srcSimCopy   = [PSCustomObject]@{
+                        Name = $simSrc.Name; TotalGB = $simSrc.TotalGB
+                        FreeGB = $srcFreeAfter; LatencyMs = $simSrc.LatencyMs
+                    }
+                    $projectedSrcScore = (Measure-CsvHappiness -CsvMetrics $srcSimCopy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
 
-                # Apply rule-aware adjustment to the source-relief score used for selection
-                $adjustedSrcScore = $projectedSrcScore
-                if ($impact.HasSoftViolation) { $adjustedSrcScore = [Math]::Max(0,   $adjustedSrcScore - $SoftRuleViolationPenalty) }
-                if ($impact.FixesViolation)   { $adjustedSrcScore = [Math]::Min(100, $adjustedSrcScore + $RuleComplianceBonus) }
+                    # Simulate destination after VM arrives
+                    $dstFreeAfter = $dst.FreeGB - $vm.TotalVhdGB
+                    $dstSimCopy   = [PSCustomObject]@{
+                        Name = $dst.Name; TotalGB = $dst.TotalGB
+                        FreeGB = $dstFreeAfter; LatencyMs = $dst.LatencyMs
+                    }
+                    $projectedDstScore = (Measure-CsvHappiness -CsvMetrics $dstSimCopy -SpaceWeight $SpaceWeight -IoWeight $IoWeight).HappinessScore
 
-                $improvement = $adjustedSrcScore - $currentSrcScore
+                    # Never plan a happiness-based move that pushes the DESTINATION
+                    # below the aggression threshold — whether it was already unhappy
+                    # (piling more onto a struggling CSV) or currently healthy (this
+                    # move alone would make it the next CSV needing relief). Pass 1's
+                    # rule-compliance fixes are exempt from this (see that pass's own
+                    # comment) since a hard-rule violation must be resolved regardless
+                    # of the happiness cost.
+                    if ($projectedDstScore -lt $happinessThreshold) { continue }
 
-                if ($improvement -gt $bestImprovement) {
-                    $bestImprovement = $improvement
-                    $bestMigration = [PSCustomObject]@{
-                        VMName             = $vm.VMName
-                        VMId               = $vm.VMId
-                        HostNode           = $vm.HostNode
-                        SourceCSV          = $simSrc.Path
-                        SourceCSVName      = $simSrc.Name
-                        DestinationCSV     = $dst.Path
-                        DestinationCSVName = $dst.Name
-                        VHDCount           = $vm.VHDs.Count
-                        TotalVhdGB         = $vm.TotalVhdGB
-                        SourceFreeGBBefore = [Math]::Round($simSrc.FreeGB, 1)
-                        SourceFreeGBAfter  = [Math]::Round($srcFreeAfter, 1)
-                        DestFreeGBBefore   = [Math]::Round($dst.FreeGB, 1)
-                        DestFreeGBAfter    = [Math]::Round($dstFreeAfter, 1)
-                        SourceScoreBefore  = $initialScores[$srcName]
-                        SourceScoreAfter   = [Math]::Round($projectedSrcScore, 1)
-                        DestScoreBefore    = $initialScores[$dst.Name]
-                        DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
-                        Improvement        = [Math]::Round($improvement, 1)
-                        ComplianceReason   = $null
+                    # Apply rule-aware adjustment to the source-relief score used for selection
+                    $adjustedSrcScore = $projectedSrcScore
+                    if ($impact.HasSoftViolation) { $adjustedSrcScore = [Math]::Max(0,   $adjustedSrcScore - $SoftRuleViolationPenalty) }
+                    if ($impact.FixesViolation)   { $adjustedSrcScore = [Math]::Min(100, $adjustedSrcScore + $RuleComplianceBonus) }
+
+                    $improvement = $adjustedSrcScore - $currentSrcScore
+
+                    if ($improvement -gt $bestImprovement) {
+                        $bestImprovement = $improvement
+                        $bestMigration = [PSCustomObject]@{
+                            VMName             = $vm.VMName
+                            VMId               = $vm.VMId
+                            HostNode           = $vm.HostNode
+                            SourceCSV          = $simSrc.Path
+                            SourceCSVName      = $simSrc.Name
+                            DestinationCSV     = $dst.Path
+                            DestinationCSVName = $dst.Name
+                            VHDCount           = $vm.VHDs.Count
+                            TotalVhdGB         = $vm.TotalVhdGB
+                            SourceFreeGBBefore = [Math]::Round($simSrc.FreeGB, 1)
+                            SourceFreeGBAfter  = [Math]::Round($srcFreeAfter, 1)
+                            DestFreeGBBefore   = [Math]::Round($dst.FreeGB, 1)
+                            DestFreeGBAfter    = [Math]::Round($dstFreeAfter, 1)
+                            SourceScoreBefore  = $initialScores[$srcName]
+                            SourceScoreAfter   = [Math]::Round($projectedSrcScore, 1)
+                            DestScoreBefore    = $initialScores[$dst.Name]
+                            DestScoreAfter     = [Math]::Round($projectedDstScore, 1)
+                            Improvement        = [Math]::Round($improvement, 1)
+                            ComplianceReason   = $null
+                        }
                     }
                 }
             }
+
+            if ($null -eq $bestMigration -or $bestImprovement -lt $improvementThreshold) { break }
+
+            $migrations.Add($bestMigration)
+            [void]$scheduledVMs.Add($bestMigration.VMName)
+
+            # Greedy state update
+            $simCsvs[$bestMigration.SourceCSVName].FreeGB      += $bestMigration.TotalVhdGB
+            $simCsvs[$bestMigration.DestinationCSVName].FreeGB -= $bestMigration.TotalVhdGB
+            $vmCsvName[$bestMigration.VMName] = $bestMigration.DestinationCSVName
         }
-
-        if ($null -eq $bestMigration -or $bestImprovement -lt $improvementThreshold) { continue }
-
-        $migrations.Add($bestMigration)
-        [void]$scheduledVMs.Add($bestMigration.VMName)
-
-        # Greedy state update
-        $simCsvs[$bestMigration.SourceCSVName].FreeGB      += $bestMigration.TotalVhdGB
-        $simCsvs[$bestMigration.DestinationCSVName].FreeGB -= $bestMigration.TotalVhdGB
-        $vmCsvName[$bestMigration.VMName] = $bestMigration.DestinationCSVName
     }
 
     return $migrations

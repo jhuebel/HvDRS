@@ -382,6 +382,12 @@ Invoke-HvStorageDRS
 | 5–20 ms | 100 − (lat − 5) × 6.67 |
 | > 20 ms | 0 |
 
+### How a happiness-based storage move is chosen
+
+Unlike compute rebalancing (which moves at most one VM per pass), a badly-unhappy CSV can have more than one VM moved off it in the same pass: after each planned move, the source CSV is re-scored against the simulated (post-move) state, and another move is planned if it's still below the aggression threshold and a beneficial one is available — one 200 GB VM rarely brings a multi-terabyte CSV's space score up on its own.
+
+A candidate destination is never chosen if accepting the VM would leave *it* below the aggression threshold — whether it was already unhappy (piling more load onto a struggling CSV) or the move alone would make it so. HvStorageDRS won't fix one CSV by breaking another. (This guard applies only to happiness-driven moves; a hard storage-affinity-rule compliance fix is applied regardless of the happiness cost, same as compute.)
+
 ### Common Scenarios
 
 ```powershell

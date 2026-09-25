@@ -159,18 +159,58 @@ Describe 'Find-StorageMigrationCandidates — greedy state update' {
     }
 
     It 'respects reduced headroom after first planned migration when scheduling second' {
-        # Destination has 600 GB free; VM1=400 GB (fits, leaves 200), VM2=400 GB (would leave -200, excluded)
-        $src  = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 2000 -FreeGB 100
-        $dst  = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 2000 -FreeGB 600
+        # Source is large (4000 GB) so recovering one 400 GB VM doesn't single-handedly
+        # bring it up to the level-5 threshold (70) — it must still be considered for a
+        # second move. Destination starts roomy enough that accepting VM1 still leaves
+        # it well above the threshold (so the new destination-happiness filter doesn't
+        # confound this headroom-specific scenario), but not roomy enough for a second
+        # 400 GB VM once MinFreeGBReserve is applied.
+        $src  = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 4000 -FreeGB 100
+        $dst  = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 2000 -FreeGB 1200
         $vm1  = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 400
         $vm2  = New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 400
         $snap = New-StorageSnapshot -CSVs @($src, $dst) -VMs @($vm1, $vm2)
 
-        # With MinFreeGBReserve=150: VM1 leaves 600-400=200 >= 150 → OK
-        # After VM1 scheduled, simDst.FreeGB=200; VM2 would leave 200-400=-200 < 150 → excluded
-        $result = Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 5 -MinFreeGBReserve 150
+        # With MinFreeGBReserve=500: VM1 leaves 1200-400=800 >= 500 → OK (dest still 40% free → happy)
+        # After VM1 scheduled, simDst.FreeGB=800; VM2 would leave 800-400=400 < 500 → excluded
+        $result = Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 5 -MinFreeGBReserve 500
         @($result).Count | Should -Be 1
         $result[0].VMName | Should -Be 'VM1'
+    }
+
+    It 'plans a second move off the same CSV in the same pass when one move is not enough' {
+        # Source is critically full; two VMs on it, each small enough that moving just
+        # one doesn't clear the level-3 threshold (50) on its own, but moving both does.
+        # A single roomy destination has headroom and stays happy throughout.
+        $src  = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 0
+        $dst  = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 4000 -FreeGB 3000
+        $vm1  = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 150
+        $vm2  = New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 150
+        $snap = New-StorageSnapshot -CSVs @($src, $dst) -VMs @($vm1, $vm2)
+
+        # After VM1 alone: src free = 150/1000 = 15% → score = (15-10)*5 = 25 (< 50 threshold)
+        # After VM1 + VM2: src free = 300/1000 = 30% → score = 50+(30-20)*2.5 = 75 (>= 50)
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 3 -MinFreeGBReserve 100)
+
+        $result.Count | Should -Be 2
+        ($result | Select-Object -ExpandProperty VMName -Unique).Count | Should -Be 2
+        $result.DestinationCSVName | Should -Contain 'Volume2'
+    }
+
+    It 'does not choose a destination whose own score would drop below the aggression threshold' {
+        # The only candidate destination is happy before the move but would be pushed
+        # into "unhappy" territory (well below the level-3 threshold of 50) by
+        # accepting this VM — the planner must refuse that trade rather than fix one
+        # CSV by breaking another.
+        $src  = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 0
+        $dst  = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 2000 -FreeGB 600
+        $vm   = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 400
+
+        $snap = New-StorageSnapshot -CSVs @($src, $dst) -VMs @($vm)
+
+        # Dest after move: (600-400)/2000 = 10% free → score = (10-10)*5 = 0, well below 50
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -AggressionLevel 3 -MinFreeGBReserve 50)
+        $result.Count | Should -Be 0
     }
 }
 

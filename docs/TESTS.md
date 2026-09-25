@@ -400,7 +400,7 @@ Tests the CSV happiness scoring formula in `Functions/Private/Measure-CsvHappine
 
 ---
 
-### `Find-StorageMigrationCandidates.Tests.ps1` — 15 tests
+### `Find-StorageMigrationCandidates.Tests.ps1` — 30 tests
 
 Tests the storage migration planning logic in `Functions/Private/Find-StorageMigrationCandidates.ps1`. No cluster or Hyper-V cmdlets are called.
 
@@ -423,16 +423,26 @@ Tests the storage migration planning logic in `Functions/Private/Find-StorageMig
 
 **Destination selection** (1 test)
 
-- When multiple valid destinations exist, the planner selects one and produces a single candidate.
+- When multiple valid destinations exist, the planner selects the one that doesn't drop below the aggression threshold.
 
-**Greedy state update** (2 tests)
+**Greedy state update** (5 tests)
 
 - Same VM never appears twice in the migration list.
 - After first VM is planned, simulated destination headroom is reduced; second VM of same size is correctly excluded.
+- A single move that isn't enough to clear the threshold is followed by a second move off the *same* source CSV, re-scored against the simulated post-first-move state.
+- A candidate destination is refused when accepting the VM would drop its own projected score below the aggression threshold, even though it has enough free space and no rule conflict.
 
 **Output object fields** (9 tests)
 
 Verifies all fields on the returned migration object: `VMName`, `HostNode`, `SourceCSV`, `SourceCSVName`, `DestinationCSV`, `DestinationCSVName`, `TotalVhdGB`, `SourceFreeGBBefore/After`, `DestFreeGBBefore/After`, `SourceScoreBefore/After`, `DestScoreBefore/After`, `Improvement`. Also verifies sign invariants: `Improvement > 0`, `SourceScoreAfter > SourceScoreBefore`, free-GB accounting identity.
+
+**Storage rule compliance pass** (3 tests)
+
+- A hard `VmCsvAntiAffinity`/`VmVmCsvAntiAffinity` violation is fixed even when every CSV is otherwise happy; a VM already satisfying its hard rule is left alone; a candidate that would break a different hard rule is excluded during happiness rebalancing.
+
+**ExcludedVMs (Manual-pinned)** (4 tests)
+
+- A VM pinned to Manual is never chosen for a happiness-based move, even as the only VM on the only unhappy CSV; a non-excluded VM on the same CSV is still recommended; an excluded VM is skipped as a hard-rule compliance fix in favor of a movable one; when the excluded VM is the only violator, no migration is produced (rather than picking it anyway).
 
 ---
 
