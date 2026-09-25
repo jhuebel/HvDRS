@@ -41,7 +41,13 @@ function Get-ClusterSnapshot {
                     Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
 
         # ── Network (2-second delta on all Up physical adapters) ───────────────
-        $upAdapters       = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Speed -gt 0 }
+        # -Physical excludes vEthernet/Hyper-V virtual switch and SET team NIC
+        # adapters — without it, VM network traffic is counted twice (once on
+        # the physical NIC, once on the virtual adapter riding on top of it)
+        # and the virtual adapters' speeds inflate the capacity denominator,
+        # both of which understate NetworkUtilization and skew the
+        # Network-Aware destination gate.
+        $upAdapters       = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' -and $_.Speed -gt 0 }
         $totalCapacityBps = ($upAdapters | Measure-Object -Property Speed -Sum).Sum
 
         $snap1 = $upAdapters | ForEach-Object {
