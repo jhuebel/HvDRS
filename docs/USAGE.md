@@ -697,10 +697,11 @@ Check two things:
    ```
    The Verbose output shows which nodes were excluded and why.
 
-2. **Possible owners** — the VM's cluster group may restrict which nodes it can run on. Check with:
+2. **Possible owners** — the VM's cluster resource may restrict which nodes it can run on. Check with:
    ```powershell
-   Get-ClusterOwnerNode -Cluster 'PROD-CLUSTER' -Group 'Virtual Machine MyVM'
+   Get-ClusterOwnerNode -Cluster 'PROD-CLUSTER' -Resource 'Virtual Machine MyVM'
    ```
+   HVDRS reads possible owners from the `Virtual Machine <VMName>` resource (the default name Failover Cluster Manager gives it). An empty list means every node is allowed. If the resource has a non-default name, the lookup fails and HVDRS treats all nodes as eligible (visible with `-Verbose`).
 
 ### CSV IO happiness scores are all null
 

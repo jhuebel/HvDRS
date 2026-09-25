@@ -185,7 +185,9 @@ Tests the two-pass migration planning logic in `Functions/Private/Find-Migration
 **Cluster Ownership Constraints** (2 tests)
 
 - When `Get-ClusterOwnerNode` returns a restricted owner list, only listed nodes are considered as destinations.
-- When `Get-ClusterOwnerNode` throws (group not found, module absent), all cluster nodes are treated as eligible.
+- Possible owners are read from the VM *resource* (`-Resource 'Virtual Machine <name>'`), not the role/group.
+- When `Get-ClusterOwnerNode` returns an empty owner list, all cluster nodes are treated as eligible.
+- When `Get-ClusterOwnerNode` throws (resource not found, module absent), all cluster nodes are treated as eligible.
 
 **Aggression Levels** (4 tests)
 
@@ -450,7 +452,7 @@ Same shape as the compute test file above, adapted for storage: automation-overr
 
 Tests the rolling trend-window smoothing in `Functions/Private/Merge-HvDRSTrendSnapshot.ps1`.
 
-- Bootstraps a single-entry window when the history file is missing or corrupt (fail-soft, same pattern as `Get-AffinityRuleSet`).
+- Bootstraps a single-entry window when the history file is missing or corrupt (fail-soft — unlike the rules/groups/overrides stores, a bad trend file only degrades smoothing, not rule/pin enforcement).
 - Correctly averages node CPU/network utilization and VM CPU/memory-pressure across multiple recorded passes.
 - Trims history to `-WindowSize`, dropping the oldest entry once the window is full.
 - A VM present in only some prior entries is averaged over just those entries (no synthetic zero-fill).

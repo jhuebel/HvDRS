@@ -1,6 +1,6 @@
 BeforeAll {
     if (-not (Get-Command Get-ClusterOwnerNode -ErrorAction SilentlyContinue)) {
-        function Get-ClusterOwnerNode { }
+        function Get-ClusterOwnerNode { [CmdletBinding()] param($Cluster, $Resource, $Group) }
     }
 
     . "$PSScriptRoot\Helpers\New-TestObjects.ps1"
@@ -51,6 +51,20 @@ Describe 'Find-EvacuationDestination' {
         $result = Find-EvacuationDestination -VM $vm1 -Snapshot $snapshot -ExcludeNode 'NODE1' -ClusterName 'TEST-CLUSTER'
 
         $result.DestinationNode | Should -Be 'NODE3'
+    }
+
+    It 'queries possible owners on the VM resource, not the role/group' {
+        $null = Find-EvacuationDestination -VM $vm1 -Snapshot $snapshot -ExcludeNode 'NODE1' -ClusterName 'TEST-CLUSTER'
+
+        Should -Invoke Get-ClusterOwnerNode -ParameterFilter { $Resource -eq 'Virtual Machine VM1' }
+    }
+
+    It 'treats an empty possible-owner list as all nodes eligible' {
+        Mock Get-ClusterOwnerNode { [PSCustomObject]@{ OwnerNodes = @() } }
+
+        $result = Find-EvacuationDestination -VM $vm1 -Snapshot $snapshot -ExcludeNode 'NODE1' -ClusterName 'TEST-CLUSTER'
+
+        $result | Should -Not -BeNullOrEmpty
     }
 
     It 'treats all nodes as eligible when Get-ClusterOwnerNode throws' {

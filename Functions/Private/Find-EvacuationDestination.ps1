@@ -52,10 +52,17 @@ function Find-EvacuationDestination {
         [string]$ClusterName
     )
 
+    # Possible owners live on the VM resource, not the role/group — see the
+    # matching helper in Find-MigrationCandidates. Empty list or failed lookup
+    # means no restriction.
+    $allNodes       = @($Snapshot.Nodes | Select-Object -ExpandProperty NodeName)
     $possibleOwners = try {
-        (Get-ClusterOwnerNode -Cluster $ClusterName -Group "Virtual Machine $($VM.VMName)" -ErrorAction Stop).OwnerNodes.Name
+        $owners = @((Get-ClusterOwnerNode -Cluster $ClusterName -Resource "Virtual Machine $($VM.VMName)" -ErrorAction Stop).OwnerNodes |
+                    ForEach-Object { $_.Name })
+        if ($owners.Count -gt 0) { $owners } else { $allNodes }
     } catch {
-        $Snapshot.Nodes | Select-Object -ExpandProperty NodeName
+        Write-Verbose "Possible-owner lookup failed for '$($VM.VMName)' ($_) — treating all nodes as eligible."
+        $allNodes
     }
 
     $candidates = $Snapshot.Nodes | Where-Object {
