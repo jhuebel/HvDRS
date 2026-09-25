@@ -10,7 +10,10 @@ function Invoke-HvStorageDRS {
         less-loaded CSV. Uses the same aggression-level model as Invoke-HvDRS.
 
         Migrations are executed via Move-VMStorage (storage live migration), which
-        moves all VHDs and configuration files while the VM remains running.
+        moves all VHDs and configuration files while the VM remains running. Each
+        VM's files are placed in a per-VM folder on the destination CSV
+        (<CSV path>\<VMName>) so disks from different VMs that share a file name
+        (e.g. OS.vhdx) cannot collide at the CSV root.
 
         Use -WhatIf to preview recommendations without moving any data.
 
@@ -109,7 +112,10 @@ function Invoke-HvStorageDRS {
         # Aggressive rebalancing with larger headroom requirement
         Invoke-HvStorageDRS -ClusterName 'PROD-CLUSTER' -AggressionLevel 5 -MinFreeGBReserve 100
     #>
-    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    # ConfirmImpact must stay below the default $ConfirmPreference ('High'):
+    # at 'High', every ShouldProcess call prompts, which throws under a
+    # -NonInteractive scheduled task and aborts the pass before any move runs.
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [string] $ClusterName,
 
@@ -362,9 +368,14 @@ function Invoke-HvStorageDRS {
             continue
         }
 
-        $action = "Storage live-migrate '{0}' ({1:N1} GB VHDs) from '{2}' to '{3}'" -f
+        # Per-VM destination folder — never the CSV root, where same-named VHDs
+        # from different VMs would collide.
+        $vmFolder        = $migration.VMName -replace '[\\/:*?"<>|]', '_'
+        $destinationPath = '{0}\{1}' -f $migration.DestinationCSV.TrimEnd('\'), $vmFolder
+
+        $action = "Storage live-migrate '{0}' ({1:N1} GB VHDs) from '{2}' to '{3}' ({4})" -f
                   $migration.VMName, $migration.TotalVhdGB,
-                  $migration.SourceCSVName, $migration.DestinationCSVName
+                  $migration.SourceCSVName, $migration.DestinationCSVName, $destinationPath
 
         if (-not $PSCmdlet.ShouldProcess($migration.VMName, $action)) { continue }
 
@@ -375,7 +386,7 @@ function Invoke-HvStorageDRS {
         try {
             Move-VMStorage -ComputerName $migration.HostNode `
                            -VMName       $migration.VMName `
-                           -DestinationStoragePath $migration.DestinationCSV `
+                           -DestinationStoragePath $destinationPath `
                            -ErrorAction  Stop
 
             Write-Host ("{0}   Done. Source CSV score {1} → {2} (+{3})" -f

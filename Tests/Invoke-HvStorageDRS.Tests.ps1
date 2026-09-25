@@ -85,6 +85,40 @@ Describe 'Invoke-HvStorageDRS automation-level overrides' {
         Should -Invoke Move-VMStorage -Times 1
     }
 
+    It 'moves each VM into a per-VM folder on the destination CSV, not the CSV root' {
+        Mock Find-StorageMigrationCandidates {
+            @(New-StorageRecommendation -VMName 'VM1' -DestinationCSV 'C:\ClusterStorage\Volume2')
+        }
+        Mock Get-HvDRSAutomationOverrideSet { ,@() }
+        Mock Move-VMStorage { }
+
+        Invoke-HvStorageDRS -ClusterName 'TEST-CLUSTER' -Confirm:$false 6>$null | Out-Null
+
+        Should -Invoke Move-VMStorage -Times 1 -ParameterFilter {
+            $DestinationStoragePath -eq 'C:\ClusterStorage\Volume2\VM1'
+        }
+    }
+
+    It 'replaces path-invalid characters in the VM name for the destination folder' {
+        Mock Find-StorageMigrationCandidates {
+            @(New-StorageRecommendation -VMName 'WEB:01/A' -DestinationCSV 'C:\ClusterStorage\Volume2\')
+        }
+        Mock Get-HvDRSAutomationOverrideSet { ,@() }
+        Mock Move-VMStorage { }
+
+        Invoke-HvStorageDRS -ClusterName 'TEST-CLUSTER' -Confirm:$false 6>$null | Out-Null
+
+        Should -Invoke Move-VMStorage -Times 1 -ParameterFilter {
+            $DestinationStoragePath -eq 'C:\ClusterStorage\Volume2\WEB_01_A'
+        }
+    }
+
+    It 'declares a ConfirmImpact below High so non-interactive scheduled runs do not prompt' {
+        $binding = (Get-Command Invoke-HvStorageDRS).ScriptBlock.Attributes |
+                   Where-Object { $_ -is [System.Management.Automation.CmdletBindingAttribute] }
+        $binding.ConfirmImpact | Should -Not -Be ([System.Management.Automation.ConfirmImpact]::High)
+    }
+
     It 'does not call Move-VMStorage under -RecommendOnly even without an override' {
         Mock Find-StorageMigrationCandidates { @(New-StorageRecommendation -VMName 'VM1') }
         Mock Move-VMStorage { }
