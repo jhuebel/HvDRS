@@ -21,12 +21,18 @@ function Merge-HvDRSTrendSnapshot {
         single-entry window (the current snapshot only), mirroring the fail-soft
         load pattern used by Get-AffinityRuleSet.
 
+        Supports -WhatIf/-Confirm: a -WhatIf call still reads history and returns
+        the trended snapshot (so the preview reflects real smoothing), but does not
+        persist the new entry. Without this, a -WhatIf preview pass — which never
+        migrates anything — would still write to the shared history file used by
+        real passes.
+
     .OUTPUTS
         A PSCustomObject shaped exactly like Get-ClusterSnapshot's output
         (ClusterName, Timestamp, Nodes, VMs) so it is a drop-in replacement
         wherever a snapshot is consumed.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [PSCustomObject]$Snapshot,
@@ -71,14 +77,18 @@ function Merge-HvDRSTrendSnapshot {
     while ($history.Count -gt $WindowSize) { $history.RemoveAt(0) }
 
     # ── Persist the trimmed window ────────────────────────────────────────────────
-    $dir = Split-Path -LiteralPath $HistoryPath
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    # Skipped under -WhatIf: a preview pass never migrates anything, so it must
+    # not advance the shared history a real pass relies on.
+    if ($PSCmdlet.ShouldProcess($HistoryPath, 'Update HVDRS trend history')) {
+        $dir = Split-Path -LiteralPath $HistoryPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        }
+        [PSCustomObject]@{
+            Version = '1.0'
+            Entries = $history.ToArray()
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $HistoryPath -Encoding UTF8
     }
-    [PSCustomObject]@{
-        Version = '1.0'
-        Entries = $history.ToArray()
-    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $HistoryPath -Encoding UTF8
 
     # ── Build the trended (averaged) snapshot ─────────────────────────────────────
     $trendedNodes = foreach ($node in $Snapshot.Nodes) {
@@ -123,5 +133,49 @@ function Merge-HvDRSTrendSnapshot {
         Timestamp   = $Snapshot.Timestamp
         Nodes       = $trendedNodes
         VMs         = $trendedVMs
+    }
+}
+
+function Reset-HvDRSTrendHistory {
+    <#
+    .SYNOPSIS
+        Clears HVDRS's trend-smoothing history for a cluster after migrations have
+        actually executed.
+
+    .DESCRIPTION
+        Merge-HvDRSTrendSnapshot's rolling average is a poor fit for the first few
+        passes after a real migration: it keeps averaging in pre-migration samples
+        of the nodes/VMs that just moved, so a node that was just drained (or that
+        just received load) can look artificially busy or idle for up to
+        -TrendWindow more passes — potentially undoing, or delaying recognition of,
+        the very rebalancing that just happened.
+
+        Called by Invoke-HvDRS right after a pass that actually executed at least
+        one migration (never under -WhatIf/-RecommendOnly/maintenance, where
+        nothing moved and the existing history is still valid). The next pass
+        bootstraps a fresh single-entry window from the next real snapshot, the
+        same fail-soft behavior Merge-HvDRSTrendSnapshot already uses for a
+        missing/corrupt file.
+
+        A missing history file is a no-op, not an error — there is nothing to
+        reset. A failure to delete an existing file is reported with
+        Write-Warning rather than thrown, since a stale trend file only degrades
+        smoothing for a few passes; it must never fail an otherwise-successful
+        DRS pass.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$HistoryPath
+    )
+
+    if (-not (Test-Path -LiteralPath $HistoryPath)) { return }
+
+    if ($PSCmdlet.ShouldProcess($HistoryPath, 'Reset HVDRS trend history after executed migrations')) {
+        try {
+            Remove-Item -LiteralPath $HistoryPath -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not reset HVDRS trend history at '$HistoryPath' after migrating: $_"
+        }
     }
 }

@@ -436,27 +436,30 @@ Verifies all fields on the returned migration object: `VMName`, `HostNode`, `Sou
 
 ---
 
-### `Invoke-HvDRS.Tests.ps1` — 11 tests
+### `Invoke-HvDRS.Tests.ps1` — 16 tests
 
-Tests `Invoke-HvDRS`'s own control flow (mode resolution, `-PassThru` emission, automation-override gating, notification dispatch) with every collaborator (`Get-ClusterSnapshot`, `Find-MigrationCandidates`, `Get-HvDRSAutomationOverrideSet`, `Move-ClusterVirtualMachineRole`, `Send-HvDRSNotification`, etc.) stubbed and mocked — no real cluster, Hyper-V, or performance counters required.
+Tests `Invoke-HvDRS`'s own control flow (mode resolution, `-PassThru` emission, automation-override gating, trend-history reset, notification dispatch) with every collaborator (`Get-ClusterSnapshot`, `Find-MigrationCandidates`, `Get-HvDRSAutomationOverrideSet`, `Move-ClusterVirtualMachineRole`, `Merge-HvDRSTrendSnapshot`, `Reset-HvDRSTrendHistory`, `Send-HvDRSNotification`, etc.) stubbed and mocked — no real cluster, Hyper-V, or performance counters required.
 
 - `-PassThru` emits/suppresses structured recommendation objects correctly across `-RecommendOnly`, a balanced cluster, an active maintenance lock, and `-WhatIf`; `ComplianceReason` is preserved.
 - A VM pinned to `Manual` via the automation-override store is recommended but never migrated, while other VMs still execute; no override present migrates normally.
+- `Reset-HvDRSTrendHistory` is called once after a pass that actually migrated a VM with `-TrendWindow` > 1, and never called when `-TrendWindow` is left at its default, under `-RecommendOnly`, under `-WhatIf`, or when every migration in the pass failed — in every one of those cases nothing actually moved, so the existing trend history is still valid.
 - `Send-HvDRSNotification` is only called when `-WebhookUrl` or `-WriteEventLog` is set, with the correct `RecommendationCount`/`ExecutedCount`/`FailedCount` payload fields for both a balanced-cluster pass and a normal migration pass.
 
 ### `Invoke-HvStorageDRS.Tests.ps1` — 9 tests
 
 Same shape as the compute test file above, adapted for storage: automation-override gating of `Move-VMStorage`, `-PassThru` emission/suppression, and `Send-HvDRSNotification` dispatch with storage-specific payload fields.
 
-### `Merge-HvDRSTrendSnapshot.Tests.ps1` — 8 tests
+### `Merge-HvDRSTrendSnapshot.Tests.ps1` — 14 tests
 
-Tests the rolling trend-window smoothing in `Functions/Private/Merge-HvDRSTrendSnapshot.ps1`.
+Tests the rolling trend-window smoothing in `Functions/Private/Merge-HvDRSTrendSnapshot.ps1`, plus its companion `Reset-HvDRSTrendHistory`.
 
 - Bootstraps a single-entry window when the history file is missing or corrupt (fail-soft — unlike the rules/groups/overrides stores, a bad trend file only degrades smoothing, not rule/pin enforcement).
 - Correctly averages node CPU/network utilization and VM CPU/memory-pressure across multiple recorded passes.
 - Trims history to `-WindowSize`, dropping the oldest entry once the window is full.
 - A VM present in only some prior entries is averaged over just those entries (no synthetic zero-fill).
 - Capacity fields (`TotalMemoryMB`, `AvailableMemoryMB`, `LogicalProcessorCount`) and identity fields (`ClusterName`, `HostNode`, `ProcessorCount`, `MemoryAssignedMB`) pass through unchanged rather than being averaged.
+- `-WhatIf` still returns a snapshot smoothed against existing history, but does not persist the new entry or otherwise modify the history file.
+- `Reset-HvDRSTrendHistory` deletes an existing history file, no-ops when the file doesn't exist, does nothing under `-WhatIf`, and warns instead of throwing when deletion fails.
 
 ### `Find-EvacuationDestination.Tests.ps1` — 10 tests
 

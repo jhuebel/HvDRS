@@ -247,7 +247,11 @@ function Invoke-HvDRS {
 
     if ($TrendWindow -gt 1) {
         Write-Host ("{0} Smoothing over a {1}-pass trend window ({2})..." -f (& $ts), $TrendWindow, $HistoryPath)
-        $snapshot = Merge-HvDRSTrendSnapshot -Snapshot $snapshot -HistoryPath $HistoryPath -WindowSize $TrendWindow
+        # -WhatIf is forwarded explicitly so a preview pass still returns a
+        # trended snapshot (the preview reflects real smoothing) without
+        # advancing the shared history file that real passes rely on.
+        $snapshot = Merge-HvDRSTrendSnapshot -Snapshot $snapshot -HistoryPath $HistoryPath `
+                                             -WindowSize $TrendWindow -WhatIf:$WhatIfPreference
     }
 
     Write-Host ("{0} Snapshot complete: {1} node(s), {2} running VM(s)" -f
@@ -440,6 +444,15 @@ function Invoke-HvDRS {
         Write-Host ''
         Write-Host ("{0} HvDRS pass complete — {1} migrated, {2} failed, {3} pinned to Manual (not executed)." -f
             (& $ts), $succeeded, $failed, $pinned)
+    }
+
+    # At least one VM actually moved this pass — the trend window's averaged
+    # samples for the affected node(s)/VM(s) now reflect a placement that no
+    # longer exists, and would keep pulling this pass's smoothing toward stale
+    # pre-migration load for up to -TrendWindow more passes. Reset it so the
+    # next pass bootstraps fresh from the post-migration snapshot.
+    if ($TrendWindow -gt 1 -and $succeeded -gt 0) {
+        Reset-HvDRSTrendHistory -HistoryPath $HistoryPath
     }
 
     & $notify $migrations.Count $succeeded $failed

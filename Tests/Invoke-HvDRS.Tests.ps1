@@ -19,6 +19,20 @@ BeforeAll {
               $ExcludedVMs, $ClusterName)
         @()
     }
+    # [CmdletBinding(SupportsShouldProcess)] is required on both stubs even
+    # though they ignore -WhatIf themselves: Invoke-HvDRS calls the real
+    # Merge-HvDRSTrendSnapshot with -WhatIf:$WhatIfPreference, and only an
+    # advanced function declaring SupportsShouldProcess accepts that common
+    # parameter at all — a plain `param()` function would error on the bind.
+    function Merge-HvDRSTrendSnapshot {
+        [CmdletBinding(SupportsShouldProcess)]
+        param($Snapshot, $HistoryPath, $WindowSize)
+        $Snapshot
+    }
+    function Reset-HvDRSTrendHistory {
+        [CmdletBinding(SupportsShouldProcess)]
+        param($HistoryPath)
+    }
 
     . "$PSScriptRoot\..\Functions\Public\Invoke-HvDRS.ps1"
 
@@ -134,6 +148,57 @@ Describe 'Invoke-HvDRS automation-level overrides' {
         Invoke-HvDRS -ClusterName 'TEST-CLUSTER' 6>$null | Out-Null
 
         Should -Invoke Move-ClusterVirtualMachineRole -Times 1
+    }
+}
+
+Describe 'Invoke-HvDRS trend history reset' {
+
+    It 'resets trend history after a pass that actually migrated a VM' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Move-ClusterVirtualMachineRole { }
+        Mock Reset-HvDRSTrendHistory { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -TrendWindow 3 6>$null | Out-Null
+
+        Should -Invoke Reset-HvDRSTrendHistory -Times 1
+    }
+
+    It 'does not reset trend history when -TrendWindow is left at its default (disabled)' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Move-ClusterVirtualMachineRole { }
+        Mock Reset-HvDRSTrendHistory { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' 6>$null | Out-Null
+
+        Should -Invoke Reset-HvDRSTrendHistory -Times 0
+    }
+
+    It 'does not reset trend history under -RecommendOnly (nothing actually moved)' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Reset-HvDRSTrendHistory { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -TrendWindow 3 -RecommendOnly 6>$null | Out-Null
+
+        Should -Invoke Reset-HvDRSTrendHistory -Times 0
+    }
+
+    It 'does not reset trend history under -WhatIf (nothing actually moved)' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Reset-HvDRSTrendHistory { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -TrendWindow 3 -WhatIf 6>$null | Out-Null
+
+        Should -Invoke Reset-HvDRSTrendHistory -Times 0
+    }
+
+    It 'does not reset trend history when every migration fails' {
+        Mock Find-MigrationCandidates { @(New-Recommendation -VMName 'VM1') }
+        Mock Move-ClusterVirtualMachineRole { throw 'migration failed' }
+        Mock Reset-HvDRSTrendHistory { }
+
+        Invoke-HvDRS -ClusterName 'TEST-CLUSTER' -TrendWindow 3 -WarningAction SilentlyContinue 6>$null | Out-Null
+
+        Should -Invoke Reset-HvDRSTrendHistory -Times 0
     }
 }
 

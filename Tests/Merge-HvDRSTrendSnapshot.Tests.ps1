@@ -103,4 +103,61 @@ Describe 'Merge-HvDRSTrendSnapshot' {
         $result.VMs[0].ProcessorCount | Should -Be 8
         $result.VMs[0].MemoryAssignedMB | Should -Be 16384
     }
+
+    It 'does not persist to the history file under -WhatIf' {
+        $snapshot = New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1' -CpuUtil 80.0) -VMs @()
+
+        $result = Merge-HvDRSTrendSnapshot -Snapshot $snapshot -HistoryPath $historyPath -WindowSize 3 -WhatIf
+
+        $result.Nodes[0].CpuUtilization | Should -Be 80.0
+        Test-Path -LiteralPath $historyPath | Should -BeFalse
+    }
+
+    It 'still smooths against existing history under -WhatIf without advancing it' {
+        $first  = New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1' -CpuUtil 20.0) -VMs @()
+        $null   = Merge-HvDRSTrendSnapshot -Snapshot $first -HistoryPath $historyPath -WindowSize 3
+        $before = Get-Content -LiteralPath $historyPath -Raw
+
+        $second = New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1' -CpuUtil 100.0) -VMs @()
+        $result = Merge-HvDRSTrendSnapshot -Snapshot $second -HistoryPath $historyPath -WindowSize 3 -WhatIf
+
+        # Averaged with the persisted first entry (20.0), not just the current one
+        $result.Nodes[0].CpuUtilization | Should -Be 60.0
+        (Get-Content -LiteralPath $historyPath -Raw) | Should -Be $before
+    }
+}
+
+Describe 'Reset-HvDRSTrendHistory' {
+
+    BeforeEach {
+        $script:historyPath = 'TestDrive:\history.json'
+    }
+
+    It 'deletes an existing history file' {
+        Set-Content -LiteralPath $historyPath -Value '{"Version":"1.0","Entries":[]}'
+
+        Reset-HvDRSTrendHistory -HistoryPath $historyPath
+
+        Test-Path -LiteralPath $historyPath | Should -BeFalse
+    }
+
+    It 'is a no-op when the history file does not exist' {
+        { Reset-HvDRSTrendHistory -HistoryPath $historyPath } | Should -Not -Throw
+        Test-Path -LiteralPath $historyPath | Should -BeFalse
+    }
+
+    It 'does not delete the file under -WhatIf' {
+        Set-Content -LiteralPath $historyPath -Value '{"Version":"1.0","Entries":[]}'
+
+        Reset-HvDRSTrendHistory -HistoryPath $historyPath -WhatIf
+
+        Test-Path -LiteralPath $historyPath | Should -BeTrue
+    }
+
+    It 'warns instead of throwing when the file cannot be removed' {
+        Set-Content -LiteralPath $historyPath -Value '{"Version":"1.0","Entries":[]}'
+        Mock Remove-Item { throw 'access denied' }
+
+        { Reset-HvDRSTrendHistory -HistoryPath $historyPath -WarningAction SilentlyContinue } | Should -Not -Throw
+    }
 }

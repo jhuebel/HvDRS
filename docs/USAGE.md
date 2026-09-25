@@ -160,6 +160,8 @@ Invoke-HvDRS -ClusterName 'PROD-CLUSTER' -TrendWindow 3
 - History persists at `-HistoryPath` (default `$env:ProgramData\HvDRS\history\<ClusterName>.json`) between calls — this only makes sense for a **recurring** job (a scheduled task running `Invoke-HvDRS` every few minutes), since a single one-off run has nothing to average against yet.
 - Capacity fields (free memory, logical processor count) are never smoothed — they reflect current headroom, not a multi-pass trend.
 - A VM or node that appears in only some of the recent passes (added/removed between them) is simply averaged over however many entries it does appear in.
+- A `-WhatIf` preview still smooths against existing history so the preview is representative, but never writes to the history file — a dry run never advances the window a real pass relies on.
+- History is automatically reset after any pass that actually executes at least one migration. Without this, the rolling average for a node/VM that just moved would keep including its pre-migration samples for up to `-TrendWindow` more passes, working against the very rebalancing that just happened. The next pass simply bootstraps a fresh single-entry window, the same as a missing history file.
 
 ---
 
