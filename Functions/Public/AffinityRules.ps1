@@ -454,7 +454,7 @@ function Test-HvDRSAffinityCompliance {
         @{ N='Type';     E={ $_.Type } },
         @{ N='Enforced'; E={ $_.Enforced } },
         @{ N='VMs';      E={ $_.VMs -join ', ' } },
-        @{ N='Detail';   E={ $_.Description } }
+        @{ N='Detail';   E={ $_.Description } } | Out-Host
 
     return $violations
 }
@@ -519,7 +519,7 @@ function Test-HvDRSStorageAffinityCompliance {
         @{ N='Type';     E={ $_.Type } },
         @{ N='Enforced'; E={ $_.Enforced } },
         @{ N='VMs';      E={ $_.VMs -join ', ' } },
-        @{ N='Detail';   E={ $_.Description } }
+        @{ N='Detail';   E={ $_.Description } } | Out-Host
 
     return $violations
 }

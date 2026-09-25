@@ -503,6 +503,14 @@ Tests `Functions/Private/Send-HvDRSNotification.ps1`, with `Invoke-RestMethod`, 
 - Creates the event log source only when it doesn't already exist, then writes the entry; a write failure warns instead of throwing.
 - Sends to both channels when both are specified.
 
+### `ComplianceWrappers.Tests.ps1` — 5 tests
+
+Tests `Test-HvDRSAffinityCompliance` / `Test-HvDRSStorageAffinityCompliance` in `Functions/Public/AffinityRules.ps1`, with `Get-ClusterSnapshot`/`Get-StorageSnapshot` mocked.
+
+- The returned collection contains only the violation object(s) — a `Format-Table` call in each function is piped to `Out-Host` specifically so its own stream objects (`FormatStartData`, `FormatEntryData`, …) don't get mixed into the function's return value ahead of the real violations.
+- Returns an empty array (not `$null`) when every configured rule is satisfied.
+- Returns an empty array without collecting a snapshot at all when no (storage) rules are configured for the cluster.
+
 ---
 
 ## What Is Not Tested
