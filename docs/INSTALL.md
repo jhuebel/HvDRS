@@ -180,10 +180,20 @@ Register-ScheduledTask `
 
 Run a separate, more frequent task that only reports happiness scores without migrating:
 
+> ⚠️ **Don't log this with `>> file 2>&1`.** Most of `Invoke-HvDRS`'s human-readable
+> output (the node summary, happiness score, and recommendation tables) is written
+> with `Format-Table | Out-Host`, which renders directly to the console host and
+> bypasses PowerShell's output streams entirely — `2>&1` only merges the error
+> stream, and even `*>>` (which *would* also capture the `Write-Host` status lines)
+> cannot capture `Out-Host` output. A plain redirect log ends up nearly empty. Use
+> `Start-Transcript`, which captures everything written to the host, or consume
+> `-PassThru` (structured objects) / `-WebhookUrl` / `-WriteEventLog` instead if you
+> want the data programmatically rather than as a human-readable log.
+
 ```powershell
 $monitorAction = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
-    -Argument '-NonInteractive -WindowStyle Hidden -Command "Import-Module HVDRS; Invoke-HvDRS -ClusterName ''PROD-CLUSTER'' -RecommendOnly" >> C:\Logs\HvDRS\monitor.log 2>&1'
+    -Argument '-NonInteractive -WindowStyle Hidden -Command "Start-Transcript -Path C:\Logs\HvDRS\monitor.log -Append; Import-Module HVDRS; Invoke-HvDRS -ClusterName ''PROD-CLUSTER'' -RecommendOnly; Stop-Transcript"'
 
 $monitorTrigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 5) -Once -At (Get-Date)
 
