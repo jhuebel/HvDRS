@@ -112,9 +112,13 @@ function Find-StorageMigrationCandidates {
     $pathToName = @{}
     foreach ($csv in $Snapshot.CSVs) { $pathToName[$csv.Path] = $csv.Name }
 
-    # VM → current CSV-name mapping (used for rule evaluation)
+    # VM → CSV-name mapping, updated as moves are planned and passed to
+    # Get-StorageMigrationRuleImpact so each rule check sees every move already
+    # planned in this pass. Unmapped paths are kept as-is, matching that function.
     $vmCsvName = @{}
-    foreach ($vm in $Snapshot.VMs) { $vmCsvName[$vm.VMName] = $pathToName[$vm.PrimaryCSV] }
+    foreach ($vm in $Snapshot.VMs) {
+        $vmCsvName[$vm.VMName] = if ($vm.PrimaryCSV -and $pathToName.ContainsKey($vm.PrimaryCSV)) { $pathToName[$vm.PrimaryCSV] } else { $vm.PrimaryCSV }
+    }
 
     # Helper: score a simulated CSV object
     $scoreSimCsv = {
@@ -160,7 +164,8 @@ function Find-StorageMigrationCandidates {
 
                 foreach ($dst in $candidates) {
                     $impact = Get-StorageMigrationRuleImpact -VMName $vmName -DestinationCsvName $dst.Name `
-                                                              -Snapshot $Snapshot -RuleSet $RuleSet
+                                                              -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                              -Placement $vmCsvName
 
                     if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
 
@@ -211,6 +216,7 @@ function Find-StorageMigrationCandidates {
                 [void]$scheduledVMs.Add($bestFix.VMName)
                 $simCsvs[$bestFix.SourceCSVName].FreeGB      += $bestFix.TotalVhdGB
                 $simCsvs[$bestFix.DestinationCSVName].FreeGB -= $bestFix.TotalVhdGB
+                $vmCsvName[$bestFix.VMName] = $bestFix.DestinationCSVName
             } else {
                 Write-Verbose "  No valid CSV destination found to resolve: $($violation.Description)"
             }
@@ -255,7 +261,8 @@ function Find-StorageMigrationCandidates {
                 # Storage rule impact check
                 $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
                     Get-StorageMigrationRuleImpact -VMName $vm.VMName -DestinationCsvName $dst.Name `
-                                                   -Snapshot $Snapshot -RuleSet $RuleSet
+                                                   -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                   -Placement $vmCsvName
                 } else {
                     [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
                 }
@@ -320,6 +327,7 @@ function Find-StorageMigrationCandidates {
         # Greedy state update
         $simCsvs[$bestMigration.SourceCSVName].FreeGB      += $bestMigration.TotalVhdGB
         $simCsvs[$bestMigration.DestinationCSVName].FreeGB -= $bestMigration.TotalVhdGB
+        $vmCsvName[$bestMigration.VMName] = $bestMigration.DestinationCSVName
     }
 
     return $migrations

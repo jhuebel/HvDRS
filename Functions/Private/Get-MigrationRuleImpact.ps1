@@ -17,6 +17,13 @@ function Get-MigrationRuleImpact {
 
           Neutral (no change in satisfaction status) → no flags set.
 
+    .PARAMETER Placement
+        Optional VMName → HostNode hashtable to evaluate against instead of the
+        snapshot's own placement. Planners pass their simulated placement here so
+        that migrations already planned earlier in the same pass are taken into
+        account — otherwise two moves that are each rule-safe against the original
+        placement could together break a hard rule.
+
     .OUTPUTS
         PSCustomObject: HasHardViolation, HasSoftViolation, FixesViolation,
                         HardReasons[], SoftReasons[], FixReasons[]
@@ -26,7 +33,8 @@ function Get-MigrationRuleImpact {
         [Parameter(Mandatory)] [string]          $VMName,
         [Parameter(Mandatory)] [string]          $DestinationNode,
         [Parameter(Mandatory)] [PSCustomObject]  $Snapshot,
-        [PSCustomObject[]]                        $RuleSet
+        [PSCustomObject[]]                        $RuleSet,
+        [hashtable]                               $Placement
     )
 
     $empty = [PSCustomObject]@{
@@ -40,9 +48,13 @@ function Get-MigrationRuleImpact {
 
     if (-not $RuleSet -or $RuleSet.Count -eq 0) { return $empty }
 
-    # Current placement: VMName → HostNode
+    # Current placement: VMName → HostNode (simulated placement when supplied)
     $vmHost = @{}
-    foreach ($vm in $Snapshot.VMs) { $vmHost[$vm.VMName] = $vm.HostNode }
+    if ($null -ne $Placement) {
+        foreach ($key in $Placement.Keys) { $vmHost[$key] = $Placement[$key] }
+    } else {
+        foreach ($vm in $Snapshot.VMs) { $vmHost[$vm.VMName] = $vm.HostNode }
+    }
 
     $hardReasons = [System.Collections.Generic.List[string]]::new()
     $softReasons = [System.Collections.Generic.List[string]]::new()

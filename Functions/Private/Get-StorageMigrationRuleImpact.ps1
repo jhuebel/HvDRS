@@ -17,6 +17,12 @@ function Get-StorageMigrationRuleImpact {
           Fix (currently violated → will be satisfied):
             → FixesViolation = $true  (caller should apply a score bonus)
 
+    .PARAMETER Placement
+        Optional VMName → CSV-name hashtable to evaluate against instead of the
+        snapshot's own placement. Find-StorageMigrationCandidates passes its
+        simulated placement here so storage moves already planned earlier in the
+        same pass are taken into account.
+
     .OUTPUTS
         PSCustomObject: HasHardViolation, HasSoftViolation, FixesViolation,
                         HardReasons[], SoftReasons[], FixReasons[]
@@ -26,7 +32,8 @@ function Get-StorageMigrationRuleImpact {
         [Parameter(Mandatory)] [string]          $VMName,
         [Parameter(Mandatory)] [string]          $DestinationCsvName,
         [Parameter(Mandatory)] [PSCustomObject]  $Snapshot,
-        [PSCustomObject[]]                        $RuleSet
+        [PSCustomObject[]]                        $RuleSet,
+        [hashtable]                               $Placement
     )
 
     $empty = [PSCustomObject]@{
@@ -44,8 +51,12 @@ function Get-StorageMigrationRuleImpact {
     foreach ($csv in $Snapshot.CSVs) { $pathToName[$csv.Path] = $csv.Name }
 
     $vmCsv = @{}
-    foreach ($vm in $Snapshot.VMs) {
-        $vmCsv[$vm.VMName] = if ($pathToName.ContainsKey($vm.PrimaryCSV)) { $pathToName[$vm.PrimaryCSV] } else { $vm.PrimaryCSV }
+    if ($null -ne $Placement) {
+        foreach ($key in $Placement.Keys) { $vmCsv[$key] = $Placement[$key] }
+    } else {
+        foreach ($vm in $Snapshot.VMs) {
+            $vmCsv[$vm.VMName] = if ($pathToName.ContainsKey($vm.PrimaryCSV)) { $pathToName[$vm.PrimaryCSV] } else { $vm.PrimaryCSV }
+        }
     }
 
     $hardReasons = [System.Collections.Generic.List[string]]::new()

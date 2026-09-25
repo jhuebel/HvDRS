@@ -195,3 +195,22 @@ Describe 'Get-StorageMigrationRuleImpact — output object structure' {
         $props | Should -Contain 'FixReasons'
     }
 }
+
+Describe 'Get-StorageMigrationRuleImpact — simulated -Placement' {
+
+    It 'evaluates against -Placement instead of the snapshot placement' {
+        # Snapshot: VM1 + VM2 both on Volume1 (violated). Simulated placement:
+        # VM1 already planned onto Volume2 — so VM2 → Volume2 now BREAKS the rule.
+        $snap = New-ImpactStorageSnapshot @(
+            New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1'
+            New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume1'
+        )
+        $rule      = New-VmVmCsvAntiAffinityRule -VMs @('VM1','VM2') -Enforced $true
+        $placement = @{ VM1 = 'Volume2'; VM2 = 'Volume1' }
+
+        $result = Get-StorageMigrationRuleImpact -VMName 'VM2' -DestinationCsvName 'Volume2' `
+                                                 -Snapshot $snap -RuleSet @($rule) -Placement $placement
+        $result.HasHardViolation | Should -BeTrue
+        $result.FixesViolation   | Should -BeFalse
+    }
+}

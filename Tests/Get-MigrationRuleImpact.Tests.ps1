@@ -267,3 +267,35 @@ Describe 'Get-MigrationRuleImpact — output object structure' {
         $result.SoftReasons.Count   | Should -Be 0
     }
 }
+
+Describe 'Get-MigrationRuleImpact — simulated -Placement' {
+
+    It 'evaluates against -Placement instead of the snapshot placement' {
+        # Snapshot: VM1 + VM2 co-located on NODE1 (violated). Simulated placement:
+        # VM1 already planned onto NODE2 — so VM2 → NODE2 now BREAKS the rule
+        # rather than fixing it.
+        $snap = New-ImpactSnapshot @(
+            New-VmMetrics -Name 'VM1' -HostNode 'NODE1'
+            New-VmMetrics -Name 'VM2' -HostNode 'NODE1'
+        )
+        $rule      = New-VmVmAntiAffinityRule -VMs @('VM1','VM2') -Enforced $true
+        $placement = @{ VM1 = 'NODE2'; VM2 = 'NODE1' }
+
+        $result = Get-MigrationRuleImpact -VMName 'VM2' -DestinationNode 'NODE2' `
+                                          -Snapshot $snap -RuleSet @($rule) -Placement $placement
+        $result.HasHardViolation | Should -BeTrue
+        $result.FixesViolation   | Should -BeFalse
+    }
+
+    It 'falls back to the snapshot placement when -Placement is omitted' {
+        $snap = New-ImpactSnapshot @(
+            New-VmMetrics -Name 'VM1' -HostNode 'NODE1'
+            New-VmMetrics -Name 'VM2' -HostNode 'NODE1'
+        )
+        $rule   = New-VmVmAntiAffinityRule -VMs @('VM1','VM2') -Enforced $true
+        $result = Get-MigrationRuleImpact -VMName 'VM2' -DestinationNode 'NODE2' `
+                                          -Snapshot $snap -RuleSet @($rule)
+        $result.FixesViolation   | Should -BeTrue
+        $result.HasHardViolation | Should -BeFalse
+    }
+}

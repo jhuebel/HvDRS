@@ -2,7 +2,7 @@ BeforeAll {
     # Stub Get-ClusterOwnerNode so Pester can mock it on machines without the
     # FailoverClusters module installed (e.g. developer workstations / CI agents).
     if (-not (Get-Command Get-ClusterOwnerNode -ErrorAction SilentlyContinue)) {
-        function Get-ClusterOwnerNode { }
+        function Get-ClusterOwnerNode { [CmdletBinding()] param($Cluster, $Resource, $Group) }
     }
 
     . "$PSScriptRoot\Helpers\New-TestObjects.ps1"
@@ -164,6 +164,27 @@ Describe 'Find-MigrationCandidates' {
                                                -AggressionLevel 3 -ClusterName 'TEST'
             $result.Count            | Should -Be 1
             $result[0].DestinationNode | Should -Be 'NODE3'
+        }
+
+        It 'queries possible owners on the VM resource, not the role/group' {
+            Mock Get-ClusterOwnerNode {
+                [PSCustomObject]@{ OwnerNodes = @([PSCustomObject]@{ Name = 'NODE2' }) }
+            }
+
+            $null = Find-MigrationCandidates -Snapshot $script:baseSnapshot `
+                                             -AggressionLevel 3 -ClusterName 'TEST'
+            Should -Invoke Get-ClusterOwnerNode -ParameterFilter {
+                $Resource -eq 'Virtual Machine VM1'
+            }
+        }
+
+        It 'treats an empty possible-owner list as all nodes eligible' {
+            Mock Get-ClusterOwnerNode { [PSCustomObject]@{ OwnerNodes = @() } }
+
+            $result = Find-MigrationCandidates -Snapshot $script:baseSnapshot `
+                                               -AggressionLevel 3 -ClusterName 'TEST'
+            $result.Count              | Should -Be 1
+            $result[0].DestinationNode | Should -Be 'NODE2'
         }
 
         It 'falls back to all nodes when Get-ClusterOwnerNode throws' {
@@ -369,6 +390,41 @@ Describe 'Find-MigrationCandidates' {
                                                -AggressionLevel 3 -ClusterName 'TEST'
             $uniqueVms = @($result | Select-Object -ExpandProperty VMName -Unique)
             $uniqueVms.Count | Should -Be $result.Count
+        }
+    }
+
+    # ── Rule checks see moves planned earlier in the same pass ─────────────────
+    Describe 'Rule impact uses simulated placement' {
+
+        BeforeAll {
+            . "$PSScriptRoot\..\Functions\Private\Test-AffinityCompliance.ps1"
+            . "$PSScriptRoot\..\Functions\Private\Get-MigrationRuleImpact.ps1"
+        }
+
+        It 'does not move a second anti-affinity member onto the node a compliance move just used' {
+            # DC1 + DC2 (hard anti-affinity) share hot NODE1. Pass 1 moves DC1 to the
+            # idle NODE2 (projected 100). In Pass 2, DC2 is still unhappy; evaluated
+            # against the ORIGINAL placement, NODE2 would look like a rule *fix*
+            # (+bonus → 100) and beat NODE3 (62.5 + 25 = 87.5), co-locating both DCs.
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $hot  = New-HostMetrics -Name 'NODE1' -CpuUtil 100.0 -AvailMemMB 60000 -LPs 32 -NetUtil 10.0
+            $idle = New-HostMetrics -Name 'NODE2' -CpuUtil 20.0  -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $busy = New-HostMetrics -Name 'NODE3' -CpuUtil 80.0  -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $dc1  = New-VmMetrics -Name 'DC1' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $dc2  = New-VmMetrics -Name 'DC2' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $snap = New-Snapshot -Nodes @($hot, $idle, $busy) -VMs @($dc1, $dc2)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'DC AA'; Type = 'VmVmAntiAffinity'; Enforced = $true
+                VMs = @('DC1', 'DC2'); Hosts = @(); CSVs = @()
+            }
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -RuleSet @($rule) -ClusterName 'TEST')
+
+            $result.Count | Should -Be 2
+            ($result | Where-Object VMName -eq 'DC1').DestinationNode | Should -Be 'NODE2'
+            ($result | Where-Object VMName -eq 'DC2').DestinationNode | Should -Be 'NODE3'
         }
     }
 }

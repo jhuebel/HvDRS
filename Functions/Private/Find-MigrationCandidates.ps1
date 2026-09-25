@@ -90,6 +90,12 @@ function Find-MigrationCandidates {
         }
     }
 
+    # Mutable simulated placement (VMName → HostNode) — updated as migrations are
+    # planned and passed to Get-MigrationRuleImpact, so each rule check sees every
+    # move already planned in this pass rather than the original snapshot placement.
+    $simPlacement = @{}
+    foreach ($vm in $Snapshot.VMs) { $simPlacement[$vm.VMName] = $vm.HostNode }
+
     $scheduledVMs = [System.Collections.Generic.HashSet[string]]::new()
     $migrations   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -141,17 +147,26 @@ function Find-MigrationCandidates {
         $src.AvailableMemoryMB = $src.AvailableMemoryMB + $vm.MemoryAssignedMB
         $dst.CpuUtilization    = [Math]::Min(100.0, $dst.CpuUtilization   + $dstLoad)
         $dst.AvailableMemoryMB = $dst.AvailableMemoryMB - $vm.MemoryAssignedMB
+        $simPlacement[$vm.VMName] = $dstName
     }
 
     # ── Helper: get cluster possible-owners for a VM ──────────────────────────
+    # Possible owners live on the VM *resource* ("Virtual Machine <name>"), not on
+    # the role/group (named after the VM itself), whose owner list is the
+    # *preferred* owners — usually empty. An empty possible-owner list means no
+    # restriction, as does a lookup failure (e.g. a non-default resource name).
     $getPossibleOwners = {
         param($vmName)
+        $allNodes = @($Snapshot.Nodes | Select-Object -ExpandProperty NodeName)
         try {
-            (Get-ClusterOwnerNode -Cluster $ClusterName `
-                                  -Group "Virtual Machine $vmName" `
-                                  -ErrorAction Stop).OwnerNodes.Name
+            $owners = @((Get-ClusterOwnerNode -Cluster $ClusterName `
+                                              -Resource "Virtual Machine $vmName" `
+                                              -ErrorAction Stop).OwnerNodes |
+                        ForEach-Object { $_.Name })
+            if ($owners.Count -gt 0) { $owners } else { $allNodes }
         } catch {
-            $Snapshot.Nodes | Select-Object -ExpandProperty NodeName
+            Write-Verbose "  Possible-owner lookup failed for '$vmName' ($_) — treating all nodes as eligible."
+            $allNodes
         }
     }
 
@@ -190,7 +205,8 @@ function Find-MigrationCandidates {
                 foreach ($candidate in $candidates) {
                     $impact = Get-MigrationRuleImpact -VMName $vmName `
                                                       -DestinationNode $candidate.NodeName `
-                                                      -Snapshot $Snapshot -RuleSet $RuleSet
+                                                      -Snapshot $Snapshot -RuleSet $RuleSet `
+                                                      -Placement $simPlacement
 
                     # Skip destinations that break another hard rule or don't fix this one
                     if ($impact.HasHardViolation -or -not $impact.FixesViolation) { continue }
@@ -254,7 +270,8 @@ function Find-MigrationCandidates {
             $impact = if ($RuleSet -and $RuleSet.Count -gt 0) {
                 Get-MigrationRuleImpact -VMName $vm.VMName `
                                         -DestinationNode $candidate.NodeName `
-                                        -Snapshot $Snapshot -RuleSet $RuleSet
+                                        -Snapshot $Snapshot -RuleSet $RuleSet `
+                                        -Placement $simPlacement
             } else {
                 [PSCustomObject]@{ HasHardViolation=$false; HasSoftViolation=$false; FixesViolation=$false }
             }
