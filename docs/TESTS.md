@@ -471,13 +471,15 @@ Tests the shared node-evacuation destination selector in `Functions/Private/Find
 - Picks the destination with the highest projected happiness when multiple are valid.
 - Verifies the documented side effect: a successful call updates the chosen destination's simulated `CpuUtilization`/`AvailableMemoryMB` in place and sets the VM's `HostNode`, so two sequential calls in the same evacuation pass don't double-book one destination.
 
-### `Maintenance.Tests.ps1` — 9 tests
+### `Maintenance.Tests.ps1` — 16 tests
 
-Tests `Enter-HvDRSNodeMaintenance`, `Exit-HvDRSNodeMaintenance`, and `Get-HvDRSNodeMaintenanceStatus` in `Functions/Public/Maintenance.ps1`, with `Get-ClusterSnapshot`, `Find-EvacuationDestination`, `Move-ClusterVirtualMachineRole`, `Suspend-ClusterNode`, `Resume-ClusterNode`, and `Get-ClusterNode` all mocked.
+Tests `Enter-HvDRSNodeMaintenance`, `Exit-HvDRSNodeMaintenance`, and `Get-HvDRSNodeMaintenanceStatus` in `Functions/Public/Maintenance.ps1`, with `Get-ClusterSnapshot`, `Find-EvacuationDestination`, `Move-ClusterVirtualMachineRole`, `Suspend-ClusterNode`, `Resume-ClusterNode`, `Get-ClusterNode`, and `Get-ClusterGroup` all mocked. `Get-HvDRSMaintenanceStatus`/`Enable-HvDRSMaintenance`/`Disable-HvDRSMaintenance` (the maintenance-lock functions defined earlier in the same file) are exercised for real in most tests, and mocked directly in the lock-specific tests below to assert on them in isolation.
 
 - An empty node evacuates trivially and gets paused; a node with a placeable VM migrates it and then pauses.
 - The node is **not** paused when a VM has no valid destination, and **not** paused when a migration call throws.
 - `-WhatIf` previews the full evacuation + pause plan without calling `Move-ClusterVirtualMachineRole` or `Suspend-ClusterNode`.
+- The HVDRS maintenance lock is enabled and disabled around a real evacuation; left untouched if the cluster was already in maintenance beforehand; never actually created under `-WhatIf` (so nothing gets released afterward); and still released via `finally` even if evacuation throws unexpectedly.
+- A non-VM cluster role (or any role this call didn't evacuate) still owned by the node is reported in `OtherRolesOnNode` without blocking the pause; a VM role this call already evacuated is not double-reported; an unavailable `Get-ClusterGroup` degrades to an empty list rather than failing the pass.
 - `Exit-HvDRSNodeMaintenance` calls `Resume-ClusterNode` (skipped under `-WhatIf`).
 - `Get-HvDRSNodeMaintenanceStatus` reports all nodes or filters to one via `-NodeName`.
 

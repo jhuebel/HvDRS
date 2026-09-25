@@ -122,14 +122,36 @@ function Enter-HvDRSNodeMaintenance {
         and the failure is reported — pausing a node that still has unmovable VMs
         on it would strand them there indefinitely.
 
+        For the duration of the evacuation, the HVDRS maintenance lock (the same
+        one Enable-HvDRSMaintenance/-MaintenanceLockFile controls) is held so a
+        concurrently-scheduled Invoke-HvDRS/Invoke-HvStorageDRS pass cannot
+        migrate a VM back onto the node while it is still being drained. If the
+        lock was already active before this call (an operator-initiated
+        maintenance window), it is left active afterward; otherwise it is
+        released once the evacuation finishes, whether or not the node ends up
+        paused.
+
+        Only running VMs known to HVDRS's snapshot are evacuated. Stopped/saved
+        VMs and any other (non-VM) cluster role still owned by the node are not
+        moved — the same happiness-based destination selection doesn't apply to
+        them — but they are surfaced via -Verbose and the returned object's
+        OtherRolesOnNode property rather than silently left behind, since pausing
+        the node does not evacuate them either.
+
         Use -WhatIf to preview the full evacuation + pause plan without moving
-        anything or pausing the node.
+        anything, pausing the node, or touching the maintenance lock.
 
     .PARAMETER ClusterName
         Target Failover Cluster. Defaults to the local cluster if omitted.
 
     .PARAMETER NodeName
         The cluster node to drain and pause.
+
+    .PARAMETER MaintenanceLockFile
+        Path to the HVDRS maintenance lock file held for the duration of the
+        evacuation. Must match the -MaintenanceLockFile path used by Invoke-HvDRS/
+        Invoke-HvStorageDRS for the lock to actually block them.
+        Default: $env:ProgramData\HvDRS\maintenance.lock
 
     .PARAMETER RulesPath
         Path to the JSON affinity rule store. Same default/semantics as Invoke-HvDRS.
@@ -177,6 +199,8 @@ function Enter-HvDRSNodeMaintenance {
         [Parameter(Mandatory)]
         [string]$NodeName,
 
+        [string]$MaintenanceLockFile = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\maintenance.lock'),
+
         [string]$RulesPath = (Join-Path (Get-HvDRSDataRoot) 'HvDRS\rules.json'),
 
         [ValidateRange(0.0, 1.0)]
@@ -206,96 +230,141 @@ function Enter-HvDRSNodeMaintenance {
         catch { throw "No -ClusterName specified and no local cluster detected. $_" }
     }
 
-    Write-Host "Collecting cluster snapshot..."
-    $snapshot = Get-ClusterSnapshot -ClusterName $ClusterName -SampleCount $SampleCount -SampleIntervalSeconds $SampleIntervalSeconds
-    $ruleSet  = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
-
-    $vmsToEvacuate = @($snapshot.VMs | Where-Object { $_.HostNode -eq $NodeName })
-
-    if ($vmsToEvacuate.Count -eq 0) {
-        Write-Host "No running VMs found on '$NodeName'."
-    } else {
-        Write-Host "Evacuating $($vmsToEvacuate.Count) VM(s) from '$NodeName'..."
+    # ── Hold the HVDRS maintenance lock for the duration of the evacuation ──────
+    # Closes the race where a concurrently-scheduled Invoke-HvDRS/
+    # Invoke-HvStorageDRS pass migrates a VM back onto this node while it is
+    # still being drained. If an operator already put the cluster into
+    # maintenance beforehand, that state is left exactly as it was — we only
+    # ever release a lock we ourselves created. Never taken under -WhatIf
+    # (Enable-HvDRSMaintenance's own ShouldProcess no-ops there).
+    $wasMaintenanceActive = (Get-HvDRSMaintenanceStatus -LockFile $MaintenanceLockFile).MaintenanceActive
+    $weEnabledLock        = $false
+    if (-not $wasMaintenanceActive) {
+        Enable-HvDRSMaintenance -Reason "Node maintenance: draining '$NodeName'" `
+                                -LockFile $MaintenanceLockFile -WhatIf:$WhatIfPreference | Out-Null
+        if (-not $WhatIfPreference) { $weEnabledLock = $true }
     }
 
-    $results   = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $allPlaced = $true
+    try {
+        Write-Host "Collecting cluster snapshot..."
+        $snapshot = Get-ClusterSnapshot -ClusterName $ClusterName -SampleCount $SampleCount -SampleIntervalSeconds $SampleIntervalSeconds
+        $ruleSet  = Get-AffinityRuleSet -Path $RulesPath -ClusterName $ClusterName
 
-    foreach ($vm in $vmsToEvacuate) {
-        $dest = Find-EvacuationDestination -VM $vm -Snapshot $snapshot -ExcludeNode $NodeName `
-                                           -RuleSet $ruleSet -CpuWeight $CpuWeight -MemoryWeight $MemoryWeight `
-                                           -MaxDestinationNetworkUtil $MaxDestinationNetworkUtil `
-                                           -DestinationMemoryReserveMB $DestinationMemoryReserveMB `
-                                           -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
-                                           -RuleComplianceBonus $RuleComplianceBonus `
-                                           -ClusterName $ClusterName
+        $vmsToEvacuate = @($snapshot.VMs | Where-Object { $_.HostNode -eq $NodeName })
 
-        if (-not $dest) {
-            $allPlaced = $false
-            Write-Warning "No valid destination found for '$($vm.VMName)' — it will remain on '$NodeName'."
-            $results.Add([PSCustomObject]@{
-                VMName          = $vm.VMName
-                DestinationNode = $null
-                Succeeded       = $false
-                Message         = 'No valid destination found'
-            })
-            continue
+        if ($vmsToEvacuate.Count -eq 0) {
+            Write-Host "No running VMs found on '$NodeName'."
+        } else {
+            Write-Host "Evacuating $($vmsToEvacuate.Count) VM(s) from '$NodeName'..."
         }
 
-        $action = "Live-migrate '{0}' from '{1}' to '{2}' [projected score {3}]" -f
-                  $vm.VMName, $NodeName, $dest.DestinationNode, $dest.ProjectedScore
+        $results   = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $allPlaced = $true
 
-        if (-not $PSCmdlet.ShouldProcess($vm.VMName, $action)) {
-            $results.Add([PSCustomObject]@{
-                VMName          = $vm.VMName
-                DestinationNode = $dest.DestinationNode
-                Succeeded       = $false
-                Message         = 'Skipped (-WhatIf)'
-            })
-            continue
+        foreach ($vm in $vmsToEvacuate) {
+            $dest = Find-EvacuationDestination -VM $vm -Snapshot $snapshot -ExcludeNode $NodeName `
+                                               -RuleSet $ruleSet -CpuWeight $CpuWeight -MemoryWeight $MemoryWeight `
+                                               -MaxDestinationNetworkUtil $MaxDestinationNetworkUtil `
+                                               -DestinationMemoryReserveMB $DestinationMemoryReserveMB `
+                                               -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
+                                               -RuleComplianceBonus $RuleComplianceBonus `
+                                               -ClusterName $ClusterName
+
+            if (-not $dest) {
+                $allPlaced = $false
+                Write-Warning "No valid destination found for '$($vm.VMName)' — it will remain on '$NodeName'."
+                $results.Add([PSCustomObject]@{
+                    VMName          = $vm.VMName
+                    DestinationNode = $null
+                    Succeeded       = $false
+                    Message         = 'No valid destination found'
+                })
+                continue
+            }
+
+            $action = "Live-migrate '{0}' from '{1}' to '{2}' [projected score {3}]" -f
+                      $vm.VMName, $NodeName, $dest.DestinationNode, $dest.ProjectedScore
+
+            if (-not $PSCmdlet.ShouldProcess($vm.VMName, $action)) {
+                $results.Add([PSCustomObject]@{
+                    VMName          = $vm.VMName
+                    DestinationNode = $dest.DestinationNode
+                    Succeeded       = $false
+                    Message         = 'Skipped (-WhatIf)'
+                })
+                continue
+            }
+
+            try {
+                Move-ClusterVirtualMachineRole -Cluster $ClusterName -Name $vm.VMName `
+                                               -Node $dest.DestinationNode -MigrationType Live -ErrorAction Stop | Out-Null
+                Write-Host "  Migrated '$($vm.VMName)' -> '$($dest.DestinationNode)' (score $($dest.ProjectedScore))"
+                $results.Add([PSCustomObject]@{
+                    VMName          = $vm.VMName
+                    DestinationNode = $dest.DestinationNode
+                    Succeeded       = $true
+                    Message         = 'Migrated'
+                })
+            } catch {
+                $allPlaced = $false
+                Write-Warning "Migration of '$($vm.VMName)' to '$($dest.DestinationNode)' failed: $_"
+                $results.Add([PSCustomObject]@{
+                    VMName          = $vm.VMName
+                    DestinationNode = $dest.DestinationNode
+                    Succeeded       = $false
+                    Message         = "Migration failed: $_"
+                })
+            }
         }
 
+        # ── Anything else still owned by the node? ──────────────────────────────
+        # Stopped/saved VMs (excluded from the snapshot, which only covers
+        # Running VMs) and any non-VM cluster role are not evacuated by this
+        # function — the happiness-based destination selection has no meaning
+        # for them. Surfaced rather than silently left behind: pausing the node
+        # does not move them either, and the operator may need to handle them
+        # separately (Move-ClusterGroup, Start-VM elsewhere, etc.).
+        $otherRoles = @()
         try {
-            Move-ClusterVirtualMachineRole -Cluster $ClusterName -Name $vm.VMName `
-                                           -Node $dest.DestinationNode -MigrationType Live -ErrorAction Stop | Out-Null
-            Write-Host "  Migrated '$($vm.VMName)' -> '$($dest.DestinationNode)' (score $($dest.ProjectedScore))"
-            $results.Add([PSCustomObject]@{
-                VMName          = $vm.VMName
-                DestinationNode = $dest.DestinationNode
-                Succeeded       = $true
-                Message         = 'Migrated'
+            $handledRoleNames = @($vmsToEvacuate | ForEach-Object { "Virtual Machine $($_.VMName)" })
+            $otherRoles = @(Get-ClusterGroup -Cluster $ClusterName -ErrorAction Stop | Where-Object {
+                $_.OwnerNode.Name -eq $NodeName -and $handledRoleNames -notcontains $_.Name
+            } | ForEach-Object {
+                [PSCustomObject]@{ Name = $_.Name; GroupType = $_.GroupType.ToString() }
             })
+            if ($otherRoles.Count -gt 0) {
+                Write-Warning ("'{0}' still owns {1} other cluster role(s) this function did not evacuate: {2}" -f
+                    $NodeName, $otherRoles.Count, (($otherRoles | ForEach-Object { $_.Name }) -join ', '))
+            }
         } catch {
-            $allPlaced = $false
-            Write-Warning "Migration of '$($vm.VMName)' to '$($dest.DestinationNode)' failed: $_"
-            $results.Add([PSCustomObject]@{
-                VMName          = $vm.VMName
-                DestinationNode = $dest.DestinationNode
-                Succeeded       = $false
-                Message         = "Migration failed: $_"
-            })
+            Write-Verbose "Could not enumerate remaining cluster roles on '$NodeName': $_"
         }
-    }
 
-    $nodePaused = $false
-    if (-not $allPlaced) {
-        Write-Warning "Not all VMs could be evacuated from '$NodeName' — node will NOT be paused."
-    } elseif ($PSCmdlet.ShouldProcess($NodeName, 'Pause cluster node (Suspend-ClusterNode)')) {
-        try {
-            Suspend-ClusterNode -Cluster $ClusterName -Name $NodeName -ErrorAction Stop | Out-Null
-            Write-Host "Node '$NodeName' paused."
-            $nodePaused = $true
-        } catch {
-            Write-Warning "Failed to pause node '$NodeName': $_"
+        $nodePaused = $false
+        if (-not $allPlaced) {
+            Write-Warning "Not all VMs could be evacuated from '$NodeName' — node will NOT be paused."
+        } elseif ($PSCmdlet.ShouldProcess($NodeName, 'Pause cluster node (Suspend-ClusterNode)')) {
+            try {
+                Suspend-ClusterNode -Cluster $ClusterName -Name $NodeName -ErrorAction Stop | Out-Null
+                Write-Host "Node '$NodeName' paused."
+                $nodePaused = $true
+            } catch {
+                Write-Warning "Failed to pause node '$NodeName': $_"
+            }
         }
-    }
 
-    [PSCustomObject]@{
-        ClusterName = $ClusterName
-        NodeName    = $NodeName
-        Evacuated   = $results.ToArray()
-        AllPlaced   = $allPlaced
-        NodePaused  = $nodePaused
+        [PSCustomObject]@{
+            ClusterName      = $ClusterName
+            NodeName         = $NodeName
+            Evacuated        = $results.ToArray()
+            AllPlaced        = $allPlaced
+            NodePaused       = $nodePaused
+            OtherRolesOnNode = $otherRoles
+        }
+    } finally {
+        if ($weEnabledLock) {
+            Disable-HvDRSMaintenance -LockFile $MaintenanceLockFile -Confirm:$false | Out-Null
+        }
     }
 }
 

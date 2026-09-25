@@ -17,6 +17,7 @@ BeforeAll {
     function Suspend-ClusterNode { param($Cluster, $Name) }
     function Resume-ClusterNode { param($Cluster, $Name) }
     function Get-ClusterNode { param($Cluster) }
+    function Get-ClusterGroup { param($Cluster) @() }
 
     . "$PSScriptRoot\..\Functions\Public\Maintenance.ps1"
 }
@@ -91,6 +92,101 @@ Describe 'Enter-HvDRSNodeMaintenance' {
 
         Should -Invoke Move-ClusterVirtualMachineRole -Times 0
         Should -Invoke Suspend-ClusterNode -Times 0
+    }
+}
+
+Describe 'Enter-HvDRSNodeMaintenance maintenance lock' {
+
+    BeforeEach {
+        Mock Get-ClusterSnapshot { New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1') -VMs @() }
+        Mock Suspend-ClusterNode { }
+    }
+
+    It 'enables and disables the HVDRS maintenance lock around a real evacuation' {
+        Mock Get-HvDRSMaintenanceStatus { [PSCustomObject]@{ MaintenanceActive = $false } }
+        Mock Enable-HvDRSMaintenance { }
+        Mock Disable-HvDRSMaintenance { }
+
+        Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false | Out-Null
+
+        Should -Invoke Enable-HvDRSMaintenance -Times 1
+        Should -Invoke Disable-HvDRSMaintenance -Times 1
+    }
+
+    It 'leaves an already-active maintenance window alone (neither enables nor disables it)' {
+        Mock Get-HvDRSMaintenanceStatus { [PSCustomObject]@{ MaintenanceActive = $true } }
+        Mock Enable-HvDRSMaintenance { }
+        Mock Disable-HvDRSMaintenance { }
+
+        Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false | Out-Null
+
+        Should -Invoke Enable-HvDRSMaintenance -Times 0
+        Should -Invoke Disable-HvDRSMaintenance -Times 0
+    }
+
+    It 'never actually creates the lock under -WhatIf, so nothing is released afterward' {
+        Mock Get-HvDRSMaintenanceStatus { [PSCustomObject]@{ MaintenanceActive = $false } }
+        Mock Enable-HvDRSMaintenance { }
+        Mock Disable-HvDRSMaintenance { }
+
+        Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -WhatIf | Out-Null
+
+        Should -Invoke Enable-HvDRSMaintenance -ParameterFilter { $WhatIf -eq $true }
+        Should -Invoke Disable-HvDRSMaintenance -Times 0
+    }
+
+    It 'still releases the lock it created even if evacuation throws unexpectedly' {
+        Mock Get-HvDRSMaintenanceStatus { [PSCustomObject]@{ MaintenanceActive = $false } }
+        Mock Enable-HvDRSMaintenance { }
+        Mock Disable-HvDRSMaintenance { }
+        Mock Get-ClusterSnapshot { throw 'cluster unreachable' }
+
+        { Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false } | Should -Throw
+
+        Should -Invoke Disable-HvDRSMaintenance -Times 1
+    }
+}
+
+Describe 'Enter-HvDRSNodeMaintenance other cluster roles' {
+
+    It 'reports a non-VM role left on the node without blocking the pause' {
+        Mock Get-ClusterSnapshot { New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1') -VMs @() }
+        Mock Suspend-ClusterNode { }
+        Mock Get-ClusterGroup {
+            @([PSCustomObject]@{ Name = 'File Share Witness'; OwnerNode = [PSCustomObject]@{ Name = 'NODE1' }; GroupType = 'GenericService' })
+        }
+
+        $result = Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false -WarningAction SilentlyContinue
+
+        $result.NodePaused | Should -BeTrue
+        $result.OtherRolesOnNode.Count | Should -Be 1
+        $result.OtherRolesOnNode[0].Name | Should -Be 'File Share Witness'
+    }
+
+    It 'does not report a VM role this call already evacuated' {
+        $vm1 = New-VmMetrics -Name 'VM1' -HostNode 'NODE1'
+        Mock Get-ClusterSnapshot { New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1'), (New-HostMetrics -Name 'NODE2') -VMs @($vm1) }
+        Mock Find-EvacuationDestination { [PSCustomObject]@{ VMName = 'VM1'; DestinationNode = 'NODE2'; ProjectedScore = 90.0 } }
+        Mock Move-ClusterVirtualMachineRole { }
+        Mock Suspend-ClusterNode { }
+        Mock Get-ClusterGroup {
+            @([PSCustomObject]@{ Name = 'Virtual Machine VM1'; OwnerNode = [PSCustomObject]@{ Name = 'NODE1' }; GroupType = 'VirtualMachine' })
+        }
+
+        $result = Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false
+
+        $result.OtherRolesOnNode.Count | Should -Be 0
+    }
+
+    It 'reports an empty list (not an error) when Get-ClusterGroup is unavailable' {
+        Mock Get-ClusterSnapshot { New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1') -VMs @() }
+        Mock Suspend-ClusterNode { }
+        Mock Get-ClusterGroup { throw 'cluster service unreachable' }
+
+        $result = Enter-HvDRSNodeMaintenance -ClusterName 'TEST-CLUSTER' -NodeName 'NODE1' -Confirm:$false -Verbose 4>$null
+
+        $result.OtherRolesOnNode.Count | Should -Be 0
+        $result.NodePaused | Should -BeTrue
     }
 }
 

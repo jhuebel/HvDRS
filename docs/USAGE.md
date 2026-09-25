@@ -243,6 +243,10 @@ Get-HvDRSNodeMaintenanceStatus -ClusterName 'PROD-CLUSTER' -NodeName 'HV-NODE3'
 
 If any VM on the node has no valid destination (e.g. a hard `VmHostAffinity` rule leaves nowhere else it's allowed to run), **the node is not paused** — pausing it would strand that VM there indefinitely. The returned object's `AllPlaced` / `NodePaused` fields report this; check them (or the console warning) before assuming the node is safe to take down.
 
+For the duration of the evacuation, `Enter-HvDRSNodeMaintenance` holds the same HVDRS maintenance lock `Enable-HvDRSMaintenance` uses (`-MaintenanceLockFile`, same default path), so a concurrently-scheduled `Invoke-HvDRS`/`Invoke-HvStorageDRS` pass can't migrate a VM back onto the node while it's still being drained. If the cluster was already in a maintenance window before the call, that state is left as-is; otherwise the lock is released once the evacuation finishes (whether or not the node ends up paused). `-WhatIf` never actually takes the lock.
+
+Only VMs the snapshot reports as **Running** are evacuated. Stopped/saved VMs and any other (non-VM) cluster role still owned by the node — a file share witness, a generic service, a SQL AG listener — are not moved by this function; pausing the node doesn't move them either. They're surfaced via a console warning and the returned object's `OtherRolesOnNode` property (`Name`, `GroupType`) rather than silently left behind, so you know to handle them separately before taking the node down.
+
 ---
 
 ## Understanding Invoke-HvDRS Output

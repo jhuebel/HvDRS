@@ -55,7 +55,7 @@ Trend smoothing (`-TrendWindow`) is currently implemented only for `Invoke-HvDRS
 
 Two related orchestration functions reuse pieces of this pipeline without running a full pass:
 
-- **`Enter-HvDRSNodeMaintenance`** collects a snapshot and rules exactly like Phase 1–2 above, then evacuates one node's VMs via `Find-EvacuationDestination` (see below) instead of `Find-MigrationCandidates` — because it must place every VM on the node regardless of whether doing so improves happiness, whereas the normal planner only moves a VM when it clears the aggression-level improvement threshold.
+- **`Enter-HvDRSNodeMaintenance`** collects a snapshot and rules exactly like Phase 1–2 above, then evacuates one node's VMs via `Find-EvacuationDestination` (see below) instead of `Find-MigrationCandidates` — because it must place every VM on the node regardless of whether doing so improves happiness, whereas the normal planner only moves a VM when it clears the aggression-level improvement threshold. It also holds the HVDRS maintenance lock for the duration (releasing it afterward only if it wasn't already held), so a concurrent scheduled `Invoke-HvDRS`/`Invoke-HvStorageDRS` pass can't undo the drain mid-flight, and reports (rather than silently skips) any stopped VM or non-VM cluster role still left on the node when it's done.
 - **`Get-HvDRSCapacityForecast`** does the same collection, then either calls `Find-EvacuationDestination` per VM (`-RemoveNode`) or a self-contained scoring loop against a synthetic node (`-AddNode` — see its own doc comment for why it can't reuse `Find-MigrationCandidates` directly: that function's possible-owner check queries the real cluster via `Get-ClusterOwnerNode`, which has no record of a node that doesn't exist yet).
 
 ---
