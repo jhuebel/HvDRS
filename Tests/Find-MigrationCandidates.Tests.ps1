@@ -555,7 +555,10 @@ Describe 'Find-MigrationCandidates' {
 
             $finalHost = @{ WEB1 = 'NODE1'; WEB2 = 'NODE2'; WEB3 = 'NODE3' }
             foreach ($m in $result) { $finalHost[$m.VMName] = $m.DestinationNode }
-            (@($finalHost.Values) | Select-Object -Unique).Count | Should -Be 1
+            # @(...) wraps the pipeline result again: with exactly one unique value,
+            # Select-Object -Unique emits a bare scalar (not a 1-element array), which
+            # has no .Count of its own.
+            @($finalHost.Values | Select-Object -Unique).Count | Should -Be 1
         }
 
         It 'does not attempt a rule move for a rule type outside the 4 handled compute types' {
