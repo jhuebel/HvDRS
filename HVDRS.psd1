@@ -1,6 +1,6 @@
 @{
     RootModule        = 'HVDRS.psm1'
-    ModuleVersion     = '1.6.1'
+    ModuleVersion     = '1.7.0'
     GUID              = 'a3f2c1d4-8e7b-4a9f-b5c6-d2e1f0a3b4c5'
     Author            = 'Jason Huebel'
     CompanyName       = ''
@@ -45,6 +45,48 @@
             LicenseUri  = 'https://github.com/jhuebel/HvDRS/blob/main/LICENSE'
             ProjectUri  = 'https://github.com/jhuebel/HvDRS'
             ReleaseNotes = @'
+## 1.7.0
+- Fixed several correctness bugs in the compute and storage DRS planners:
+  rule-impact checks now use a live simulated placement, so a second
+  migration planned in the same pass sees the moves the first one already
+  made instead of stale snapshot data. A hard affinity/anti-affinity
+  violation spanning 3 or more VMs (e.g. three VMs sharing one host under an
+  enforced anti-affinity rule) is now actually resolved, with as many moves
+  as needed, instead of being reported unfixable forever because no single
+  move could fully satisfy it. The storage happiness planner no longer
+  "fixes" one CSV by pushing another below the aggression threshold, and
+  keeps moving VMs off a badly-unhappy CSV until it recovers instead of
+  stopping after one move. VMs pinned to Manual automation are now excluded
+  from planning entirely, not just skipped at execution after already being
+  chosen as the fix for a hard-rule violation.
+- Fixed the possible-owner lookup querying the wrong cluster object
+  (Get-ClusterOwnerNode -Group instead of -Resource), which meant the
+  possible-owner constraint documented in the README never actually applied.
+- Fixed Invoke-HvStorageDRS's ConfirmImpact ('High') blocking scheduled
+  -NonInteractive runs, and storage moves colliding when two VMs' VHDs
+  shared a file name — moves now land in a per-VM destination folder.
+- Fixed the Network-Aware gate double-counting Hyper-V virtual switch
+  adapter traffic (now -Physical-only), CSV path matching colliding between
+  e.g. "Volume1" and "Volume10", and per-VHD size using the maximum virtual
+  size instead of actual on-disk footprint.
+- Enter-HvDRSNodeMaintenance now holds the HVDRS maintenance lock for the
+  duration of an evacuation — closing a race with a concurrently-scheduled
+  Invoke-HvDRS/Invoke-HvStorageDRS pass — via a new -MaintenanceLockFile
+  parameter, and reports any stopped VM or non-VM cluster role left on the
+  node via a new OtherRolesOnNode property instead of silently ignoring them.
+- Fixed -TrendWindow smoothing persisting to the shared history file under
+  -WhatIf, and added an automatic history reset after a pass that actually
+  migrates a VM so smoothing doesn't keep pulling toward a placement that no
+  longer exists.
+- Fixed Test-HvDRSAffinityCompliance / Test-HvDRSStorageAffinityCompliance
+  leaking Format-Table's own formatting objects into their return value.
+- The rules/groups/automation-overrides JSON stores now fail closed (throw)
+  when the file exists but is corrupt, instead of silently treating it as
+  "nothing configured" — which previously risked the next rule/group/
+  override edit overwriting the corrupt file and permanently losing
+  everything in it.
+- Expanded the test suite substantially to cover all of the above.
+
 ## 1.6.1
 - Fixed latent bugs, of the same class fixed in 1.5.1, that only surfaced under
   Set-StrictMode (which the publish pipeline enables) and were caught while
