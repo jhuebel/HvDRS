@@ -190,4 +190,20 @@ Describe 'Set-HvDRSGroup' {
     }
 }
 
+Describe 'Get-HvDRSGroupSet — fail-closed on an unreadable store' {
+
+    It 'throws instead of returning an empty group set when groups.json is corrupt' {
+        Set-Content -LiteralPath $testGroupsPath -Value '{ not valid json'
+
+        { Get-HvDRSGroupSet -Path $testGroupsPath -ClusterName 'PROD' } | Should -Throw
+    }
+
+    It 'throws instead of silently dropping every group when Add-HvDRSGroup is called against a corrupt store' {
+        Set-Content -LiteralPath $testGroupsPath -Value '{ not valid json'
+
+        { Add-HvDRSGroup -ClusterName 'PROD' -Name 'G1' -Type Vm -Members @('VM1') -GroupsPath $testGroupsPath } | Should -Throw
+
+        (Get-Content -LiteralPath $testGroupsPath -Raw) | Should -Be '{ not valid json'
+    }
+}
 }

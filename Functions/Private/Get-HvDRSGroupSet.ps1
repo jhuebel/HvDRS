@@ -11,18 +11,25 @@ function Get-HvDRSGroupSet {
     # populated array (which would make it cross as a single pipeline object).
     if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
 
+    # Fail closed: a file that exists but can't be read must NOT be treated as
+    # "no groups" — rules referencing groups would silently lose those members
+    # (so enforced rules would stop covering them), and the next group edit
+    # would overwrite the file.
     try {
-        $data   = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-        $groups = @($data.Groups)
-        if ($ClusterName) {
-            $groups = @($groups | Where-Object { $_.ClusterName -eq $ClusterName })
+        $data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($null -eq $data -or -not $data.PSObject.Properties['Groups']) {
+            throw "the file has no 'Groups' property"
         }
-        if ($groups.Count -eq 0) { return ,@() }
-        return $groups
     } catch {
-        Write-Warning "Could not load HVDRS groups from '$Path': $_"
-        return ,@()
+        throw "Could not read the HVDRS group store '$Path': $_. Refusing to continue without it (rules referencing groups would lose members). Fix or restore the file, or delete it if no groups are needed."
     }
+
+    $groups = @($data.Groups | Where-Object { $null -ne $_ })
+    if ($ClusterName) {
+        $groups = @($groups | Where-Object { $_.ClusterName -eq $ClusterName })
+    }
+    if ($groups.Count -eq 0) { return ,@() }
+    return $groups
 }
 
 function Save-HvDRSGroupSet {

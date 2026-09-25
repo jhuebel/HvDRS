@@ -501,4 +501,31 @@ Describe 'Group expansion in Get-AffinityRuleSet' {
     }
 }
 
+Describe 'Get-AffinityRuleSet — fail-closed on unreadable stores' {
+
+    It 'throws instead of returning an empty rule set when rules.json is corrupt' {
+        Set-Content -LiteralPath $testRulesPath -Value '{ not valid json'
+
+        { Get-AffinityRuleSet -Path $testRulesPath -ClusterName 'CLUSTER1' } | Should -Throw
+    }
+
+    It 'throws instead of silently dropping every rule when Add-HvDRSAffinityRule is called against a corrupt store' {
+        Set-Content -LiteralPath $testRulesPath -Value '{ not valid json'
+
+        { Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAffinity' `
+                                -VMs @('VM1','VM2') -RulesPath $testRulesPath } | Should -Throw
+
+        # The corrupt file must be left untouched — a resave here would have
+        # permanently discarded every other cluster's rules.
+        (Get-Content -LiteralPath $testRulesPath -Raw) | Should -Be '{ not valid json'
+    }
+
+    It 'throws when the group store referenced during expansion is corrupt' {
+        Add-HvDRSAffinityRule -ClusterName 'CLUSTER1' -Name 'R1' -Type 'VmVmAffinity' `
+                              -VMs @('VM1') -VMGroups @('G1') -RulesPath $testRulesPath
+        Set-Content -LiteralPath $testGroupsPath -Value '{ not valid json'
+
+        { Get-AffinityRuleSet -Path $testRulesPath -GroupsPath $testGroupsPath -ClusterName 'CLUSTER1' } | Should -Throw
+    }
+}
 }

@@ -13,7 +13,10 @@ function Get-AffinityRuleSet {
         Editing a group's membership with Set-HvDRSGroup therefore takes effect on
         the very next read of any rule that references it, with no rule re-save
         required. A missing groups.json degrades gracefully to "no groups defined" —
-        rules behave exactly as if only their literal VMs/Hosts/CSVs were set.
+        rules behave exactly as if only their literal VMs/Hosts/CSVs were set. A
+        groups.json that exists but fails to parse is not treated the same way:
+        it throws, propagating out of this function, rather than silently
+        dropping every group's members from every rule that references one.
 
         -SkipGroupExpansion returns rules exactly as stored, with no group
         expansion. Add/Remove/Set-HvDRSAffinityRule use this when they load the
@@ -39,59 +42,68 @@ function Get-AffinityRuleSet {
     # style consumption elsewhere in this module.
     if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
 
+    # Fail closed: a rule store that exists but can't be read must NOT be treated
+    # as "no rules" — Invoke-HvDRS would then plan migrations that break enforced
+    # rules, and the next Add/Set/Remove-HvDRSAffinityRule would resave the file
+    # with only its own change, wiping every other rule for every cluster.
     try {
-        $data  = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-        $rules = @($data.Rules)
-        if ($ClusterName) {
-            $rules = @($rules | Where-Object { $_.ClusterName -eq $ClusterName })
+        $data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($null -eq $data -or -not $data.PSObject.Properties['Rules']) {
+            throw "the file has no 'Rules' property"
         }
-        if ($rules.Count -eq 0) { return ,@() }
-        if ($SkipGroupExpansion) { return $rules }
+    } catch {
+        throw "Could not read the HVDRS affinity rule store '$Path': $_. Refusing to continue without it (enforced rules would be ignored). Fix or restore the file, or delete it if no rules are needed."
+    }
 
-        $groups = Get-HvDRSGroupSet -Path $GroupsPath -ClusterName $ClusterName
-        if ($groups.Count -gt 0) {
-            foreach ($rule in $rules) {
-                # Rules persisted before groups existed (or hand-edited JSON) won't
-                # have these properties at all — PSObject.Properties[$name] is a
-                # safe existence check that doesn't throw under Set-StrictMode,
-                # unlike dot-accessing a genuinely missing property would.
-                #
-                # The whole if-expression is wrapped in the OUTER @(...) rather than
-                # wrapping @() only around the true-branch's value: assigning the
-                # result of an if/else used as an expression re-applies PowerShell's
-                # "a single emitted object doesn't get re-collected into an array"
-                # rule to the if-statement's own output, regardless of whether the
-                # branch's value was itself already an array — e.g. a rule with
-                # exactly one -VMGroups entry would otherwise collapse to a bare
-                # string here, which has no .Count under Set-StrictMode (unlike
-                # PSCustomObject, which gets a synthetic one).
-                $vmGroups   = @( if ($rule.PSObject.Properties['VMGroups'])   { $rule.VMGroups } )
-                $hostGroups = @( if ($rule.PSObject.Properties['HostGroups']) { $rule.HostGroups } )
-                $csvGroups  = @( if ($rule.PSObject.Properties['CSVGroups'])  { $rule.CSVGroups } )
+    $rules = @($data.Rules | Where-Object { $null -ne $_ })
+    if ($ClusterName) {
+        $rules = @($rules | Where-Object { $_.ClusterName -eq $ClusterName })
+    }
+    if ($rules.Count -eq 0) { return ,@() }
+    if ($SkipGroupExpansion) { return $rules }
 
-                if ($vmGroups.Count -gt 0) {
-                    $vmGroupMembers = @($groups | Where-Object { $_.Type -eq 'Vm' -and $vmGroups -contains $_.Name } |
-                                        ForEach-Object { $_.Members })
-                    $rule.VMs = @(@($rule.VMs) + $vmGroupMembers | Select-Object -Unique)
-                }
-                if ($hostGroups.Count -gt 0) {
-                    $hostGroupMembers = @($groups | Where-Object { $_.Type -eq 'Host' -and $hostGroups -contains $_.Name } |
-                                          ForEach-Object { $_.Members })
-                    $rule.Hosts = @(@($rule.Hosts) + $hostGroupMembers | Select-Object -Unique)
-                }
-                if ($csvGroups.Count -gt 0) {
-                    $csvGroupMembers = @($groups | Where-Object { $_.Type -eq 'Csv' -and $csvGroups -contains $_.Name } |
-                                         ForEach-Object { $_.Members })
-                    $rule.CSVs = @(@($rule.CSVs) + $csvGroupMembers | Select-Object -Unique)
-                }
+    # An unreadable group store throws out of Get-HvDRSGroupSet and propagates —
+    # same fail-closed reasoning as the rule store itself.
+    $groups = Get-HvDRSGroupSet -Path $GroupsPath -ClusterName $ClusterName
+    if ($groups.Count -gt 0) {
+        foreach ($rule in $rules) {
+            # Rules persisted before groups existed (or hand-edited JSON) won't
+            # have these properties at all — PSObject.Properties[$name] is a
+            # safe existence check that doesn't throw under Set-StrictMode,
+            # unlike dot-accessing a genuinely missing property would.
+            #
+            # The whole if-expression is wrapped in the OUTER @(...) rather than
+            # wrapping @() only around the true-branch's value: assigning the
+            # result of an if/else used as an expression re-applies PowerShell's
+            # "a single emitted object doesn't get re-collected into an array"
+            # rule to the if-statement's own output, regardless of whether the
+            # branch's value was itself already an array — e.g. a rule with
+            # exactly one -VMGroups entry would otherwise collapse to a bare
+            # string here, which has no .Count under Set-StrictMode (unlike
+            # PSCustomObject, which gets a synthetic one).
+            $vmGroups   = @( if ($rule.PSObject.Properties['VMGroups'])   { $rule.VMGroups } )
+            $hostGroups = @( if ($rule.PSObject.Properties['HostGroups']) { $rule.HostGroups } )
+            $csvGroups  = @( if ($rule.PSObject.Properties['CSVGroups'])  { $rule.CSVGroups } )
+
+            if ($vmGroups.Count -gt 0) {
+                $vmGroupMembers = @($groups | Where-Object { $_.Type -eq 'Vm' -and $vmGroups -contains $_.Name } |
+                                    ForEach-Object { $_.Members })
+                $rule.VMs = @(@($rule.VMs) + $vmGroupMembers | Select-Object -Unique)
+            }
+            if ($hostGroups.Count -gt 0) {
+                $hostGroupMembers = @($groups | Where-Object { $_.Type -eq 'Host' -and $hostGroups -contains $_.Name } |
+                                      ForEach-Object { $_.Members })
+                $rule.Hosts = @(@($rule.Hosts) + $hostGroupMembers | Select-Object -Unique)
+            }
+            if ($csvGroups.Count -gt 0) {
+                $csvGroupMembers = @($groups | Where-Object { $_.Type -eq 'Csv' -and $csvGroups -contains $_.Name } |
+                                     ForEach-Object { $_.Members })
+                $rule.CSVs = @(@($rule.CSVs) + $csvGroupMembers | Select-Object -Unique)
             }
         }
-
-        return $rules
-    } catch {
-        Write-Warning "Could not load affinity rules from '$Path': $_"
-        return ,@()
     }
+
+    return $rules
 }
 
 function Save-AffinityRuleSet {

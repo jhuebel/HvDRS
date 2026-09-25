@@ -9,18 +9,24 @@ function Get-HvDRSAutomationOverrideSet {
     # empty-result branches.
     if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
 
+    # Fail closed: a file that exists but can't be read must NOT be treated as
+    # "no overrides" — that would silently un-pin every Manual VM and let the
+    # next DRS pass migrate it, and the next Set/Remove would overwrite the file.
     try {
-        $data      = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-        $overrides = @($data.Overrides)
-        if ($ClusterName) {
-            $overrides = @($overrides | Where-Object { $_.ClusterName -eq $ClusterName })
+        $data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($null -eq $data -or -not $data.PSObject.Properties['Overrides']) {
+            throw "the file has no 'Overrides' property"
         }
-        if ($overrides.Count -eq 0) { return ,@() }
-        return $overrides
     } catch {
-        Write-Warning "Could not load HVDRS automation overrides from '$Path': $_"
-        return ,@()
+        throw "Could not read the HVDRS automation override store '$Path': $_. Refusing to continue without it (Manual pins would be ignored). Fix or restore the file, or delete it if no overrides are needed."
     }
+
+    $overrides = @($data.Overrides | Where-Object { $null -ne $_ })
+    if ($ClusterName) {
+        $overrides = @($overrides | Where-Object { $_.ClusterName -eq $ClusterName })
+    }
+    if ($overrides.Count -eq 0) { return ,@() }
+    return $overrides
 }
 
 function Save-HvDRSAutomationOverrideSet {

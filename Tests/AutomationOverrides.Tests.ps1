@@ -128,4 +128,20 @@ Describe 'Remove-HvDRSVMAutomationLevel' {
     }
 }
 
+Describe 'Get-HvDRSAutomationOverrideSet — fail-closed on an unreadable store' {
+
+    It 'throws instead of returning an empty override set when automation-overrides.json is corrupt' {
+        Set-Content -LiteralPath $testOverridesPath -Value '{ not valid json'
+
+        { Get-HvDRSAutomationOverrideSet -Path $testOverridesPath -ClusterName 'C1' } | Should -Throw
+    }
+
+    It 'throws instead of silently un-pinning every VM when Set-HvDRSVMAutomationLevel is called against a corrupt store' {
+        Set-Content -LiteralPath $testOverridesPath -Value '{ not valid json'
+
+        { Set-HvDRSVMAutomationLevel -ClusterName 'C1' -VMName 'VM1' -AutomationLevel Manual -OverridesPath $testOverridesPath } | Should -Throw
+
+        (Get-Content -LiteralPath $testOverridesPath -Raw) | Should -Be '{ not valid json'
+    }
+}
 }
