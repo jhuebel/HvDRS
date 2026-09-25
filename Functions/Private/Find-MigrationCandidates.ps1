@@ -35,6 +35,17 @@ function Find-MigrationCandidates {
         Points added to a candidate's projected score when the move fixes an existing
         soft-rule violation (default: 25). Hard-rule compliance migrations are always
         recommended regardless of the happiness improvement.
+
+    .PARAMETER ExcludedVMs
+        VM names pinned to Manual automation (see Set-HvDRSVMAutomationLevel) that
+        must never be chosen as the VM to move, in either pass. Invoke-HvDRS never
+        executes a migration for one of these anyway, so letting the planner select
+        one — as the compliance fix for a hard-rule violation, or as the happiness
+        pick — only produces a recommendation that will be silently skipped at
+        execution time while a different VM that actually could have moved is
+        never considered. They remain fully present in -Snapshot for scoring,
+        compliance-violation detection, and destination-capacity accounting; they
+        are only excluded from being a move's *source* VM.
     #>
     [CmdletBinding()]
     param(
@@ -54,9 +65,13 @@ function Find-MigrationCandidates {
         [float]           $SoftRuleViolationPenalty = 25.0,
         [float]           $RuleComplianceBonus      = 25.0,
 
+        [string[]]$ExcludedVMs = @(),
+
         [Parameter(Mandatory)]
         [string]$ClusterName
     )
+
+    $excluded = [System.Collections.Generic.HashSet[string]]::new([string[]]$ExcludedVMs)
 
     # Aggression level → [happiness threshold, minimum improvement to trigger migration]
     $thresholds = @{
@@ -189,8 +204,13 @@ function Find-MigrationCandidates {
                             Where-Object { $_.Enforced })
 
         foreach ($violation in $hardViolations) {
-            $movable = @($violation.VMs | Where-Object { -not $scheduledVMs.Contains($_) })
-            if ($movable.Count -eq 0) { continue }
+            $movable = @($violation.VMs | Where-Object {
+                -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
+            })
+            if ($movable.Count -eq 0) {
+                Write-Verbose "  No movable (non-Manual) VM found to resolve: $($violation.Description)"
+                continue
+            }
 
             $bestFix   = $null
             $bestScore = -1
@@ -252,7 +272,7 @@ function Find-MigrationCandidates {
                   Sort-Object HappinessScore   # most unhappy first
 
     foreach ($score in $unhappyVMs) {
-        if ($scheduledVMs.Contains($score.VMName)) { continue }
+        if ($scheduledVMs.Contains($score.VMName) -or $excluded.Contains($score.VMName)) { continue }
 
         $vm = $Snapshot.VMs | Where-Object { $_.VMName -eq $score.VMName }
         if (-not $vm) { continue }

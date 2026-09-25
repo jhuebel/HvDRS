@@ -334,6 +334,7 @@ function Invoke-HvDRS {
                                            -RuleSet $ruleSet `
                                            -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
                                            -RuleComplianceBonus $RuleComplianceBonus `
+                                           -ExcludedVMs @($manualVMs) `
                                            -ClusterName $ClusterName `
                                            -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 

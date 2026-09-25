@@ -15,7 +15,8 @@ BeforeAll {
     function Move-ClusterVirtualMachineRole { param($Cluster, $Name, $Node, $MigrationType) }
     function Find-MigrationCandidates {
         param($Snapshot, $AggressionLevel, $CpuWeight, $MemoryWeight, $MaxDestinationNetworkUtil,
-              $DestinationMemoryReserveMB, $RuleSet, $SoftRuleViolationPenalty, $RuleComplianceBonus, $ClusterName)
+              $DestinationMemoryReserveMB, $RuleSet, $SoftRuleViolationPenalty, $RuleComplianceBonus,
+              $ExcludedVMs, $ClusterName)
         @()
     }
 

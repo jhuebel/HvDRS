@@ -49,6 +49,12 @@ function Find-StorageMigrationCandidates {
         soft storage-rule violation (default: 25). Hard-rule compliance migrations are
         always recommended regardless of the happiness improvement.
 
+    .PARAMETER ExcludedVMs
+        VM names pinned to Manual automation that must never be chosen as the VM to
+        move, in either pass — see Find-MigrationCandidates' -ExcludedVMs for why.
+        They remain fully present in -Snapshot for scoring, compliance-violation
+        detection, and destination-capacity accounting.
+
     .OUTPUTS
         List of PSCustomObjects: VMName, VMId, HostNode, SourceCSV, SourceCSVName,
         DestinationCSV, DestinationCSVName, VHDCount, TotalVhdGB,
@@ -74,8 +80,12 @@ function Find-StorageMigrationCandidates {
 
         [PSCustomObject[]] $RuleSet                  = @(),
         [float]            $SoftRuleViolationPenalty = 25.0,
-        [float]            $RuleComplianceBonus      = 25.0
+        [float]            $RuleComplianceBonus      = 25.0,
+
+        [string[]]$ExcludedVMs = @()
     )
+
+    $excluded = [System.Collections.Generic.HashSet[string]]::new([string[]]$ExcludedVMs)
 
     $thresholds = @{
         1 = @{ Happiness = 30; Improvement = 40 }
@@ -143,8 +153,13 @@ function Find-StorageMigrationCandidates {
                             Where-Object { $_.Enforced })
 
         foreach ($violation in $hardViolations) {
-            $movable = @($violation.VMs | Where-Object { -not $scheduledVMs.Contains($_) })
-            if ($movable.Count -eq 0) { continue }
+            $movable = @($violation.VMs | Where-Object {
+                -not $scheduledVMs.Contains($_) -and -not $excluded.Contains($_)
+            })
+            if ($movable.Count -eq 0) {
+                Write-Verbose "  No movable (non-Manual) VM found to resolve: $($violation.Description)"
+                continue
+            }
 
             $bestFix   = $null
             $bestScore = -1
@@ -240,10 +255,12 @@ function Find-StorageMigrationCandidates {
         $currentSrcScore = & $scoreSimCsv $simSrc
         if ($currentSrcScore -ge $happinessThreshold) { continue }
 
-        # VMs whose primary storage is on this CSV and not yet scheduled
+        # VMs whose primary storage is on this CSV, not yet scheduled, and not
+        # pinned to Manual automation
         $vmsOnSrc = $Snapshot.VMs | Where-Object {
             $pathToName[$_.PrimaryCSV] -eq $srcName -and
-            -not $scheduledVMs.Contains($_.VMName)
+            -not $scheduledVMs.Contains($_.VMName) -and
+            -not $excluded.Contains($_.VMName)
         }
         if (-not $vmsOnSrc) { continue }
 

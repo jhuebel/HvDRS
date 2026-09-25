@@ -16,7 +16,7 @@ BeforeAll {
     function Move-VMStorage { param($ComputerName, $VMName, $DestinationStoragePath) }
     function Find-StorageMigrationCandidates {
         param($Snapshot, $AggressionLevel, $SpaceWeight, $IoWeight, $MinFreeGBReserve,
-              $RuleSet, $SoftRuleViolationPenalty, $RuleComplianceBonus)
+              $RuleSet, $SoftRuleViolationPenalty, $RuleComplianceBonus, $ExcludedVMs)
         @()
     }
 

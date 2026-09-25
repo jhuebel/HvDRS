@@ -284,3 +284,58 @@ Describe 'Find-StorageMigrationCandidates — storage rule compliance pass' {
         $result[0].DestinationCSVName | Should -Be 'Volume3'
     }
 }
+
+Describe 'Find-StorageMigrationCandidates — ExcludedVMs (Manual-pinned)' {
+
+    It 'does not select an excluded VM for happiness-based rebalancing, even when it is the only unhappy CSV''s VM' {
+        $snap = New-ImbalancedSnapshot
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -ExcludedVMs @('VM1'))
+        $result.Count | Should -Be 0
+    }
+
+    It 'still recommends a non-excluded VM on the same unhappy CSV' {
+        $src = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 50
+        $dst = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 2000 -FreeGB 1800
+        $vm1 = New-VmStorageMetrics -Name 'PINNED' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 100
+        $vm2 = New-VmStorageMetrics -Name 'AUTO'   -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 100
+        $snap = New-StorageSnapshot -CSVs @($src, $dst) -VMs @($vm1, $vm2)
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -ExcludedVMs @('PINNED'))
+        $result.Count     | Should -Be 1
+        $result[0].VMName | Should -Be 'AUTO'
+    }
+
+    It 'skips an excluded VM as a hard-rule compliance fix and uses a movable VM instead' {
+        $csv1 = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 800
+        $csv2 = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 1000 -FreeGB 800
+        $vm1  = New-VmStorageMetrics -Name 'VM1' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $vm2  = New-VmStorageMetrics -Name 'VM2' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $snap = New-StorageSnapshot -CSVs @($csv1, $csv2) -VMs @($vm1, $vm2)
+
+        # Anti-affinity between VM1 and VM2 — both share Volume1, so it's violated.
+        $rule = [PSCustomObject]@{
+            RuleId='r1'; Name='Split'; Type='VmVmCsvAntiAffinity'; Enforced=$true
+            VMs=@('VM1','VM2'); CSVs=@()
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -RuleSet @($rule) -ExcludedVMs @('VM1'))
+        $result.Count     | Should -Be 1
+        $result[0].VMName | Should -Be 'VM2'
+    }
+
+    It 'reports no valid destination (rather than picking the excluded VM) when it is the only violator' {
+        $csv1 = New-CsvMetrics -Name 'Volume1' -Path 'C:\ClusterStorage\Volume1' -TotalGB 1000 -FreeGB 800
+        $csv2 = New-CsvMetrics -Name 'Volume2' -Path 'C:\ClusterStorage\Volume2' -TotalGB 1000 -FreeGB 800
+        $vm   = New-VmStorageMetrics -Name 'PINNED' -PrimaryCSV 'C:\ClusterStorage\Volume1' -TotalVhdGB 50
+        $snap = New-StorageSnapshot -CSVs @($csv1, $csv2) -VMs @($vm)
+
+        $rule = [PSCustomObject]@{
+            RuleId='r1'; Name='NoVol1'; Type='VmCsvAntiAffinity'; Enforced=$true
+            VMs=@('PINNED'); CSVs=@('Volume1')
+        }
+
+        $result = @(Find-StorageMigrationCandidates -Snapshot $snap -RuleSet @($rule) -ExcludedVMs @('PINNED') -Verbose 4>$null)
+        $result.Count | Should -Be 0
+    }
+}

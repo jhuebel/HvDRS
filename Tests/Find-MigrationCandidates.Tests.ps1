@@ -427,4 +427,68 @@ Describe 'Find-MigrationCandidates' {
             ($result | Where-Object VMName -eq 'DC2').DestinationNode | Should -Be 'NODE3'
         }
     }
+
+    Describe 'ExcludedVMs (Manual-pinned)' {
+
+        It 'does not select an excluded VM for happiness-based migration' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $result = Find-MigrationCandidates -Snapshot $script:baseSnapshot `
+                                               -AggressionLevel 3 -ClusterName 'TEST' `
+                                               -ExcludedVMs @('VM1')
+            $result.Count | Should -Be 0
+        }
+
+        It 'still migrates a non-excluded unhappy VM' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $vm2 = New-VmMetrics -Name 'VM2' -HostNode 'NODE1' -CpuUtil 100.0 -Procs 4 `
+                                 -MemAssignMB 8192 -DynMem $true -Pressure 130.0
+            $snap = New-Snapshot -Nodes @($script:n1, $script:n2) -VMs @($script:vm1, $vm2)
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -ClusterName 'TEST' -ExcludedVMs @('VM1'))
+            $result.Count     | Should -Be 1
+            $result[0].VMName | Should -Be 'VM2'
+        }
+
+        It 'skips an excluded VM as a hard-rule compliance fix and uses a movable VM instead' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $hot  = New-HostMetrics -Name 'NODE1' -CpuUtil 50.0 -AvailMemMB 60000 -LPs 32 -NetUtil 10.0
+            $idle = New-HostMetrics -Name 'NODE2' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $dc1  = New-VmMetrics -Name 'DC1' -HostNode 'NODE1' -CpuUtil 10.0
+            $dc2  = New-VmMetrics -Name 'DC2' -HostNode 'NODE1' -CpuUtil 10.0
+            $snap = New-Snapshot -Nodes @($hot, $idle) -VMs @($dc1, $dc2)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'DC AA'; Type = 'VmVmAntiAffinity'; Enforced = $true
+                VMs = @('DC1', 'DC2'); Hosts = @(); CSVs = @()
+            }
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -RuleSet @($rule) -ClusterName 'TEST' `
+                                                 -ExcludedVMs @('DC1'))
+            $result.Count              | Should -Be 1
+            $result[0].VMName          | Should -Be 'DC2'
+            $result[0].DestinationNode | Should -Be 'NODE2'
+        }
+
+        It 'reports no valid destination (rather than picking the excluded VM) when it is the only violator' {
+            Mock Get-ClusterOwnerNode { throw 'no constraints' }
+
+            $n1 = New-HostMetrics -Name 'NODE1' -CpuUtil 50.0 -AvailMemMB 60000 -LPs 32 -NetUtil 10.0
+            $n2 = New-HostMetrics -Name 'NODE2' -CpuUtil 20.0 -AvailMemMB 60000 -LPs 32 -NetUtil 5.0
+            $pinned = New-VmMetrics -Name 'PINNED' -HostNode 'NODE1' -CpuUtil 10.0
+            $snap = New-Snapshot -Nodes @($n1, $n2) -VMs @($pinned)
+            $rule = [PSCustomObject]@{
+                RuleId = 'r1'; Name = 'NoNode1'; Type = 'VmHostAntiAffinity'; Enforced = $true
+                VMs = @('PINNED'); Hosts = @('NODE1'); CSVs = @()
+            }
+
+            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                                 -RuleSet @($rule) -ClusterName 'TEST' `
+                                                 -ExcludedVMs @('PINNED') -Verbose 4>$null)
+            $result.Count | Should -Be 0
+        }
+    }
 }

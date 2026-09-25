@@ -296,6 +296,7 @@ function Invoke-HvStorageDRS {
                       -RuleSet $ruleSet `
                       -SoftRuleViolationPenalty $SoftRuleViolationPenalty `
                       -RuleComplianceBonus $RuleComplianceBonus `
+                      -ExcludedVMs @($manualVMs) `
                       -Verbose:($VerbosePreference -ne 'SilentlyContinue')
 
     $generatedAt     = [DateTime]::Now
