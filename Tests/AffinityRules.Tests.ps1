@@ -516,8 +516,9 @@ Describe 'Get-AffinityRuleSet — fail-closed on unreadable stores' {
                                 -VMs @('VM1','VM2') -RulesPath $testRulesPath } | Should -Throw
 
         # The corrupt file must be left untouched — a resave here would have
-        # permanently discarded every other cluster's rules.
-        (Get-Content -LiteralPath $testRulesPath -Raw) | Should -Be '{ not valid json'
+        # permanently discarded every other cluster's rules. (Set-Content adds
+        # a trailing newline, hence -Match rather than an exact -Be.)
+        (Get-Content -LiteralPath $testRulesPath -Raw) | Should -Match '^\{ not valid json\r?\n?$'
     }
 
     It 'throws when the group store referenced during expansion is corrupt' {

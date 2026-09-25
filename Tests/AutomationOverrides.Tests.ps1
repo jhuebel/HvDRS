@@ -141,7 +141,8 @@ Describe 'Get-HvDRSAutomationOverrideSet — fail-closed on an unreadable store'
 
         { Set-HvDRSVMAutomationLevel -ClusterName 'C1' -VMName 'VM1' -AutomationLevel Manual -OverridesPath $testOverridesPath } | Should -Throw
 
-        (Get-Content -LiteralPath $testOverridesPath -Raw) | Should -Be '{ not valid json'
+        # Set-Content adds a trailing newline, hence -Match rather than an exact -Be.
+        (Get-Content -LiteralPath $testOverridesPath -Raw) | Should -Match '^\{ not valid json\r?\n?$'
     }
 }
 }

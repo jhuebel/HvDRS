@@ -65,20 +65,20 @@ Describe 'Test-HvDRSAffinityCompliance' {
                               -VMs @('DC1', 'DC2') -Enforced -RulesPath $testRulesPath
 
         Mock Get-ClusterSnapshot {
-            New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1', New-HostMetrics -Name 'NODE2') -VMs @(
+            New-Snapshot -Nodes @((New-HostMetrics -Name 'NODE1'), (New-HostMetrics -Name 'NODE2')) -VMs @(
                 (New-VmMetrics -Name 'DC1' -HostNode 'NODE1'),
                 (New-VmMetrics -Name 'DC2' -HostNode 'NODE2')
             )
         }
 
-        $result = @(Test-HvDRSAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null)
+        $result = Test-HvDRSAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null
         $result.Count | Should -Be 0
     }
 
     It 'returns an empty array without collecting a snapshot when no rules are configured' {
         Mock Get-ClusterSnapshot { throw 'should not be called when there are no rules' }
 
-        $result = @(Test-HvDRSAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null)
+        $result = Test-HvDRSAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null
         $result.Count | Should -Be 0
         Should -Invoke Get-ClusterSnapshot -Times 0
     }
@@ -119,7 +119,7 @@ Describe 'Test-HvDRSStorageAffinityCompliance' {
 
         Mock Get-StorageSnapshot { throw 'should not be called when there are no storage rules' }
 
-        $result = @(Test-HvDRSStorageAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null)
+        $result = Test-HvDRSStorageAffinityCompliance -ClusterName 'TEST-CLUSTER' -RulesPath $testRulesPath 6>$null
         $result.Count | Should -Be 0
         Should -Invoke Get-StorageSnapshot -Times 0
     }

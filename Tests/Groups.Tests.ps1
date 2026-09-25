@@ -203,7 +203,8 @@ Describe 'Get-HvDRSGroupSet — fail-closed on an unreadable store' {
 
         { Add-HvDRSGroup -ClusterName 'PROD' -Name 'G1' -Type Vm -Members @('VM1') -GroupsPath $testGroupsPath } | Should -Throw
 
-        (Get-Content -LiteralPath $testGroupsPath -Raw) | Should -Be '{ not valid json'
+        # Set-Content adds a trailing newline, hence -Match rather than an exact -Be.
+        (Get-Content -LiteralPath $testGroupsPath -Raw) | Should -Match '^\{ not valid json\r?\n?$'
     }
 }
 }

@@ -105,6 +105,12 @@ Describe 'Merge-HvDRSTrendSnapshot' {
     }
 
     It 'does not persist to the history file under -WhatIf' {
+        # BeforeEach only sets $historyPath to a fixed literal — it doesn't
+        # guarantee the file is absent, since several other tests in this
+        # Describe intentionally chain off state a prior test left on it.
+        # This test needs a genuinely absent file, so ensure that itself.
+        if (Test-Path -LiteralPath $historyPath) { Remove-Item -LiteralPath $historyPath -Force }
+
         $snapshot = New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1' -CpuUtil 80.0) -VMs @()
 
         $result = Merge-HvDRSTrendSnapshot -Snapshot $snapshot -HistoryPath $historyPath -WindowSize 3 -WhatIf
@@ -114,6 +120,10 @@ Describe 'Merge-HvDRSTrendSnapshot' {
     }
 
     It 'still smooths against existing history under -WhatIf without advancing it' {
+        # See the previous test — this one needs to control the starting
+        # history exactly (a single 20.0 entry), not inherit a prior test's.
+        if (Test-Path -LiteralPath $historyPath) { Remove-Item -LiteralPath $historyPath -Force }
+
         $first  = New-Snapshot -Nodes @(New-HostMetrics -Name 'NODE1' -CpuUtil 20.0) -VMs @()
         $null   = Merge-HvDRSTrendSnapshot -Snapshot $first -HistoryPath $historyPath -WindowSize 3
         $before = Get-Content -LiteralPath $historyPath -Raw

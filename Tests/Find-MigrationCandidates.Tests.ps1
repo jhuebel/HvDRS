@@ -489,9 +489,15 @@ Describe 'Find-MigrationCandidates' {
                 VMs = @('PINNED'); Hosts = @('NODE1'); CSVs = @()
             }
 
-            $result = @(Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
-                                                 -RuleSet @($rule) -ClusterName 'TEST' `
-                                                 -ExcludedVMs @('PINNED') -Verbose 4>$null)
+            # Not wrapped in @() at the call site: Find-MigrationCandidates returns
+            # ",@()" (a comma-protected empty array) on the no-migrations path, which
+            # relies on the assignment's own single-item unwrapping to survive as a
+            # true empty array — @(...) around the call would instead re-collect that
+            # one stream item into a 1-element array (see Get-AffinityRuleSet.ps1's
+            # comment on this same subtlety).
+            $result = Find-MigrationCandidates -Snapshot $snap -AggressionLevel 3 `
+                                               -RuleSet @($rule) -ClusterName 'TEST' `
+                                               -ExcludedVMs @('PINNED') -Verbose 4>$null
             $result.Count | Should -Be 0
         }
     }
